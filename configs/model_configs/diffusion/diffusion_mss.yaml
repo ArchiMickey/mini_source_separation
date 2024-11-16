@@ -1,0 +1,42 @@
+model_type: diffusion_cond
+sample_rate: 44100
+audio_channels: 2
+
+model:
+  io_channels: 64
+  pretransform:
+    type: diffusers_autoencoder
+    config:
+      path: pretrained/stable-audio-vae
+  diffusion:
+    prepend_cond_ids: [mixture]
+    type: dit
+    config:
+      io_channels: 64
+      embed_dim: 768
+      prepend_cond_dim: 64
+      depth: 12
+      num_heads: 12
+      transformer_type: continuous_transformer
+
+training:
+  use_ema: true
+  optimizer_configs:
+    diffusion:
+      optimizer:
+        type: AdamW
+        config:
+          lr: 5e-5
+          betas: [0.9, 0.999]
+          weight_decay: 1e-3
+      scheduler:
+        type: InverseLR
+        config:
+          inv_gamma: 1000000
+          power: 0.5
+          warmup: 0.99
+
+demo:
+  sample_rate: ${sample_rate}
+  demo_every: 2000
+  demo_steps: 50

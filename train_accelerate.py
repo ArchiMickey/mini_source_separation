@@ -22,7 +22,7 @@ wandb.require("core")
 from data.audio import load
 from data.musdb18hq import MUSDB18HQ
 from data.crops import RandomCrop
-from train import InfiniteSampler, get_model, l1_loss, validate, warmup_lambda
+from _train import InfiniteSampler, get_model, l1_loss, validate, warmup_lambda
 
 
 def train(args):

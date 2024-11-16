@@ -4,7 +4,7 @@ from pathlib import Path
 import torch
 
 from data.musdb18hq import MUSDB18HQ
-from train import get_model, validate
+from _train import get_model, validate
 
 
 def evaluate(args):

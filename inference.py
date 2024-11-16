@@ -9,7 +9,7 @@ from tqdm import tqdm
 import museval
 import argparse
 
-from train import get_model, separate
+from _train import get_model, separate
 
 
 def inference(args):

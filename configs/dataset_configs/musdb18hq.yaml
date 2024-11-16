@@ -1,0 +1,9 @@
+train:
+  _target_: data.dataset.MUSDB18HQ
+  root: /datasets/musdb18hq
+  split: train
+
+test:
+  _target_: data.dataset.MUSDB18HQ
+  root: /datasets/musdb18hq
+  split: test
