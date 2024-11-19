@@ -2,10 +2,11 @@ def create_training_wrapper_from_config(model_config, model):
     training_config = model_config.get('training', None)
     assert training_config is not None, 'training config must be specified in model config'
     model_type = model_config.get('model_type', None)
-    if model_type == "diffusion_cond":
+    if model_type in ["diffusion_cond", "diffusion_mss"]:
         from .diffusion_mss import DiffusionMSSTrainingWrapper
         return DiffusionMSSTrainingWrapper(
             model,
+            target_instrument=training_config["target_instrument"],
             lr=training_config.get("lr", None),
             use_ema=training_config.get("use_ema", True),
             optimizer_configs=training_config.get("optimizer_configs", None),
@@ -32,7 +33,7 @@ def create_demo_callback_from_config(model_config, **kwargs):
     
     demo_config = model_config.get('demo', None)
     assert demo_config is not None, 'demo config must be specified in model config'
-    if model_type == "diffusion_cond":
+    if model_type in ["diffusion_cond", "diffusion_mss"]:
         from .diffusion_mss import DiffusionMSSDemoCallback
         return DiffusionMSSDemoCallback(
             **demo_config, **kwargs

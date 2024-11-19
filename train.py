@@ -36,9 +36,11 @@ def main(cfg):
     model_config = OmegaConf.load(cfg.model_config)
     dataset_config = OmegaConf.load(cfg.dataset_config)
     
-    train_dl = create_dataloader_from_config(dataset_config["train"], sample_rate=model_config["sample_rate"], batch_size=cfg.batch_size, num_workers=cfg.num_workers)
+    train_dl = create_dataloader_from_config(dataset_config["train"], batch_size=cfg.batch_size, num_workers=cfg.num_workers)
     
     model = create_model_from_config(model_config)
+    
+    model_summary_callback = pl.callbacks.ModelSummary(max_depth=3)
     
     training_wrapper = create_training_wrapper_from_config(model_config, model)
     
@@ -56,8 +58,8 @@ def main(cfg):
     save_model_config_callback = ModelConfigEmbedderCallback(model_config)
     
     args_dict = OmegaConf.to_container(cfg, resolve=True)
-    args_dict.update({"model_config": model_config})
-    args_dict.update({"dataset_config": dataset_config})
+    args_dict.update({"model_config": OmegaConf.to_container(model_config, resolve=True)})
+    args_dict.update({"dataset_config": OmegaConf.to_container(dataset_config, resolve=True)})
     push_wandb_config(wandb_logger, args_dict)
     
     if cfg.strategy:
@@ -65,9 +67,9 @@ def main(cfg):
     else:
         strategy = 'ddp_find_unused_parameters_true' if cfg.num_gpus > 1 else "auto"
         
-    demo_callback = create_demo_callback_from_config(model_config, demo_dl=create_dataloader_from_config(dataset_config["test"], sample_rate=model_config["sample_rate"], batch_size=8, num_workers=cfg.num_workers))
+    demo_callback = create_demo_callback_from_config(model_config, demo_dl=create_dataloader_from_config(dataset_config["test"], batch_size=8, num_workers=cfg.num_workers))
     
-    callbacks = [ckpt_callback, demo_callback, exc_callback, save_model_config_callback]
+    callbacks = [ckpt_callback, demo_callback, exc_callback, model_summary_callback, save_model_config_callback]
     
     if cfg.get("validation", None):
         callbacks += [create_validation_callback_from_config(model_config)]

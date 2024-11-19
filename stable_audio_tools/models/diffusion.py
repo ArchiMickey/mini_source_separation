@@ -8,6 +8,7 @@ import typing as tp
 from .blocks import ResConvBlock, FourierFeatures, Upsample1d, Upsample1d_2, Downsample1d, Downsample1d_2, SelfAttention1d, SkipBlock, expand_to_planes
 from .conditioners import MultiConditioner, create_multi_conditioner_from_conditioning_config
 from .dit import DiffusionTransformer
+from .transformer import AbsolutePositionalEmbedding
 from .factory import create_pretransform_from_config
 from .pretransforms import Pretransform
 from ..inference.generation import generate_diffusion_cond
@@ -215,6 +216,47 @@ class ConditionedDiffusionModelWrapper(nn.Module):
 
     def generate(self, *args, **kwargs):
         return generate_diffusion_cond(self, *args, **kwargs)
+
+class MSSDiffusionModelWrapper(ConditionedDiffusionModelWrapper):
+    def __init__(self,
+            model: ConditionedDiffusionModel,
+            conditioner: MultiConditioner,
+            mixture_dim: int,
+            mixture_max_seq_len: int,
+            io_channels,
+            sample_rate,
+            min_input_length: int,
+            diffusion_objective: tp.Literal["v", "rectified_flow"] = "v",
+            pretransform: tp.Optional[Pretransform] = None,
+            cross_attn_cond_ids: tp.List[str] = [],
+            global_cond_ids: tp.List[str] = [],
+            input_concat_ids: tp.List[str] = [],
+            prepend_cond_ids: tp.List[str] = []
+        ):
+        super().__init__(
+            model,
+            conditioner,
+            io_channels,
+            sample_rate,
+            min_input_length,
+            diffusion_objective=diffusion_objective,
+            pretransform=pretransform,
+            cross_attn_cond_ids=cross_attn_cond_ids,
+            global_cond_ids=global_cond_ids,
+            input_concat_ids=input_concat_ids,
+            prepend_cond_ids=prepend_cond_ids,
+        )
+        self.model = model
+    
+    def forward(self, x: torch.Tensor, t: torch.Tensor, cond: tp.Dict[str, tp.Any], return_cond_inputs=False, **kwargs):
+        mixture_cond_in, mixture_cond_mask = cond.get("mixture", (None, None))
+        assert mixture_cond_in is not None, "Must provide mixture conditioning"
+         
+        cond_inputs = self.get_conditioning_inputs(cond)
+        
+        if return_cond_inputs:
+            return self.model(x, t, **cond_inputs, **kwargs), cond_inputs
+        return self.model(x, t, **cond_inputs, **kwargs)
 
 class UNetCFG1DWrapper(ConditionedDiffusionModel):
     def __init__(
@@ -675,11 +717,24 @@ def create_diffusion_cond_from_config(config: tp.Dict[str, tp.Any]):
     # Get the proper wrapper class
 
     extra_kwargs = {}
-
+    
     if model_type == "diffusion_cond" or model_type == "diffusion_cond_inpaint":
         wrapper_fn = ConditionedDiffusionModelWrapper
 
         extra_kwargs["diffusion_objective"] = diffusion_objective
+    
+    elif model_type == "diffusion_mss":
+        wrapper_fn = MSSDiffusionModelWrapper
+        
+        mixture_dim = model_config.get("mixture_dim", None)
+        assert mixture_dim is not None, "Must specify mixture_dim in model config"
+        
+        mixture_max_seq_len = model_config.get("mixture_max_seq_len", None)
+        assert mixture_max_seq_len is not None, "Must specify mixture_max_seq_len in model config"
+        
+        extra_kwargs["diffusion_objective"] = diffusion_objective
+        extra_kwargs["mixture_dim"] = mixture_dim
+        extra_kwargs["mixture_max_seq_len"] = mixture_max_seq_len
 
     elif model_type == "diffusion_prior":
         prior_type = model_config.get("prior_type", None)

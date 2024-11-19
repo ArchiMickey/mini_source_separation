@@ -1,9 +1,40 @@
 train:
-  _target_: data.dataset.MUSDB18HQ
-  root: /datasets/musdb18hq
-  split: train
+  _target_: data.dataset.MSSDataset
+  data_path: /datasets/musdb18hq/train
+  metadata_path: metadata/musdb18hq_train.pkl
+  config:
+    audio:
+      sample_rate: 44100
+      chunk_size: 88064
+      min_mean_abs: 0.001
+    instruments: [vocals, bass, drums, other]
+    target_instrument: vocals
+    num_steps: 1000000
+    augmentations:
+      enable: true # enable or disable all augmentations (to fast disable if needed)
+      loudness: true # randomly change loudness of each stem on the range (loudness_min; loudness_max)
+      loudness_min: 0.5
+      loudness_max: 1.5
 
 test:
-  _target_: data.dataset.MUSDB18HQ
-  root: /datasets/musdb18hq
-  split: test
+  _target_: data.dataset.MSSDataset
+  data_path: /datasets/musdb18hq/test
+  metadata_path: metadata/musdb18hq_test.pkl
+  config:
+    audio:
+      sample_rate: 44100
+      chunk_size: 88064
+      min_mean_abs: 0.001
+    instruments: [vocals, bass, drums, other]
+    target_instrument: vocals
+    num_steps: 10000
+
+# train:
+#   _target_: data.dataset.MUSDB18HQ
+#   root: /datasets/musdb18hq
+#   split: train
+
+# test:
+#   _target_: data.dataset.MUSDB18HQ
+#   root: /datasets/musdb18hq
+#   split: test

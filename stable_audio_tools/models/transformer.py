@@ -191,6 +191,19 @@ class LayerNorm(nn.Module):
     def forward(self, x):
         return F.layer_norm(x, x.shape[-1:], weight=self.gamma, bias=self.beta)
 
+class RMSNorm(torch.nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def _norm(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+    def forward(self, x):
+        output = self._norm(x.float()).type_as(x)
+        return output * self.weight
+
 # feedforward
 
 class GLU(nn.Module):
@@ -276,7 +289,7 @@ class Attention(nn.Module):
         dim_context = None,
         causal = False,
         zero_init_output=True,
-        qk_norm: Literal['l2', 'ln', 'none'] = 'none',
+        qk_norm: Literal['l2', 'ln', 'rms', 'none'] = 'none',
         natten_kernel_size = None
     ):
         super().__init__()
@@ -305,6 +318,9 @@ class Attention(nn.Module):
         if self.qk_norm == "ln":
             self.q_norm = nn.LayerNorm(dim_heads, elementwise_affine=True, eps=1.0e-6)
             self.k_norm = nn.LayerNorm(dim_heads, elementwise_affine=True, eps=1.0e-6)
+        elif self.qk_norm == "rms":
+            self.q_norm = RMSNorm(dim_heads, eps=1.0e-6)
+            self.k_norm = RMSNorm(dim_heads, eps=1.0e-6)
 
         # Using 1d neighborhood attention
         self.natten_kernel_size = natten_kernel_size

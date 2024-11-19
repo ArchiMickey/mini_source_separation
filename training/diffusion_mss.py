@@ -48,6 +48,7 @@ class DiffusionMSSTrainingWrapper(pl.LightningModule):
     def __init__(
         self,
         model: ConditionedDiffusionModelWrapper,
+        target_instrument: str,
         lr: float = None,
         use_ema: bool = True,
         optimizer_configs: dict = None,
@@ -57,6 +58,7 @@ class DiffusionMSSTrainingWrapper(pl.LightningModule):
     ):
         super().__init__()
         
+        self.target_instrument = target_instrument
         self.diffusion = model
         
         if use_ema:
@@ -131,8 +133,9 @@ class DiffusionMSSTrainingWrapper(pl.LightningModule):
         
         loss_info = {}
         
-        diffusion_input = audios["vocals"]
-        prepend_mixture = audios["mixture"]
+        # diffusion_input = audios[self.target_instrument]
+        diffusion_input = audios["mixture"] - audios[self.target_instrument]
+        mixture_cond = audios["mixture"]
         
         p.tick("setup")
         
@@ -146,15 +149,14 @@ class DiffusionMSSTrainingWrapper(pl.LightningModule):
                     self.diffusion.pretransform.train(self.diffusion.pretransform.enable_grad)
                     
                     diffusion_input = self.diffusion.pretransform.encode(diffusion_input)
-                    prepend_mixture = self.diffusion.pretransform.encode(prepend_mixture)
+                    mixture_cond = self.diffusion.pretransform.encode(mixture_cond)
         else:            
             # Apply scale to pre-encoded latents if needed, as the pretransform encode function will not be run
             if hasattr(self.diffusion.pretransform, "scale") and self.diffusion.pretransform.scale != 1.0:
                 diffusion_input = diffusion_input / self.diffusion.pretransform.scale
-                prepend_mixture = prepend_mixture / self.diffusion.pretransform.scale
+                mixture_cond = mixture_cond / self.diffusion.pretransform.scale
         
-        prepend_mixture = rearrange(prepend_mixture, "b d n -> b n d")
-        conditioning["mixture"] = (prepend_mixture, torch.ones((prepend_mixture.shape[0], prepend_mixture.shape[1]), device=self.device))
+        conditioning["mixture"] = (mixture_cond, torch.ones((mixture_cond.shape[0], mixture_cond.shape[1]), device=self.device))
                 
         if self.timestep_sampler == "uniform":
             # Draw uniformly distributed continuous timesteps
@@ -248,7 +250,7 @@ class DiffusionMSSDemoCallback(pl.Callback):
     @rank_zero_only
     @torch.no_grad()
     def on_train_batch_end(self, trainer, module, outputs, batch, batch_idx):
-        if trainer.global_step == 0 or trainer.global_step % self.demo_every != 0 or self.last_demo_step == trainer.global_step:
+        if trainer.global_step % self.demo_every != 0 or self.last_demo_step == trainer.global_step:
             return
         
         module.eval()
@@ -259,19 +261,19 @@ class DiffusionMSSDemoCallback(pl.Callback):
         try:
             audios, info = next(iter(self.demo_dl))
             
-            prepend_mixture = audios["mixture"].to(module.device)
+            mixture = audios["mixture"].to(module.device)
+            mixture_cond = mixture
             
-            demo_samples = prepend_mixture.shape[-1]
+            demo_samples = mixture_cond.shape[-1]
             
             if module.diffusion.pretransform is not None:
                 demo_samples = demo_samples // module.diffusion.pretransform.downsampling_ratio
             
-            noise = torch.randn([prepend_mixture.shape[0], module.diffusion.io_channels, demo_samples]).to(module.device)
+            noise = torch.randn([mixture_cond.shape[0], module.diffusion.io_channels, demo_samples]).to(module.device)
             if module.diffusion.pretransform is not None:
-                prepend_mixture = module.diffusion.pretransform.encode(prepend_mixture)
+                mixture_cond = module.diffusion.pretransform.encode(mixture_cond)
             
-            prepend_mixture = rearrange(prepend_mixture, "b d n -> b n d")
-            conditioning = {"mixture": (prepend_mixture, torch.ones((prepend_mixture.shape[0], prepend_mixture.shape[1]), device=module.device))}
+            conditioning = {"mixture": (mixture_cond, torch.ones((mixture_cond.shape[0], mixture_cond.shape[1]), device=module.device))}
             
             cond_inputs = module.diffusion.get_conditioning_inputs(conditioning)
             
@@ -287,8 +289,10 @@ class DiffusionMSSDemoCallback(pl.Callback):
                     
                     if module.diffusion.pretransform is not None:
                         fakes = module.diffusion.pretransform.decode(fakes)
-
-                reals_fakes = rearrange([audios["mixture"][..., :fakes.shape[-1]], audios["vocals"][..., :fakes.shape[-1]], fakes.cpu()], "i b d n -> (b i) d n")
+                
+                reverse_fakes = audios["mixture"] - fakes
+                
+                reals_fakes = rearrange([audios["mixture"], fakes, audios[module.target_instrument], reverse_fakes], "i b d n -> (b i) d n")
                 reals_fakes = rearrange(reals_fakes, "b d n -> d (b n)")
                 
                 log_dict = {}
@@ -297,9 +301,9 @@ class DiffusionMSSDemoCallback(pl.Callback):
                 reals_fakes = reals_fakes.to(torch.float32).clamp(-1, 1).mul(32767).to(torch.int16).cpu()
                 torchaudio.save(filename, reals_fakes, self.sample_rate)
                 
-                log_dict["mss"] = wandb.Audio(filename, sample_rate=self.sample_rate, caption="MSS")
+                log_dict[f"mss_cfg_{cfg_scale}"] = wandb.Audio(filename, sample_rate=self.sample_rate, caption=f"MSS_cfg_{cfg_scale}")
                 
-                trainer.logger.experiment.log(log_dict)
+                trainer.logger.experiment.log(log_dict, step=trainer.global_step)
         
         except Exception as e:
             print(f'{type(e).__name__}: {e}')
