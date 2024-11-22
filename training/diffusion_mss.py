@@ -17,6 +17,7 @@ from pathlib import Path
 import os
 from tqdm.auto import tqdm
 from einops import rearrange
+from aeiou.viz import audio_spectrogram_image
 
 from stable_audio_tools.inference.sampling import get_alphas_sigmas, sample, sample_discrete_euler
 from stable_audio_tools.models.diffusion import ConditionedDiffusionModelWrapper
@@ -134,7 +135,7 @@ class DiffusionMSSTrainingWrapper(pl.LightningModule):
         loss_info = {}
         
         # diffusion_input = audios[self.target_instrument]
-        diffusion_input = audios["mixture"] - audios[self.target_instrument]
+        diffusion_input = audios[self.target_instrument]
         mixture_cond = audios["mixture"]
         
         p.tick("setup")
@@ -290,9 +291,8 @@ class DiffusionMSSDemoCallback(pl.Callback):
                     if module.diffusion.pretransform is not None:
                         fakes = module.diffusion.pretransform.decode(fakes)
                 
-                reverse_fakes = audios["mixture"] - fakes
                 
-                reals_fakes = rearrange([audios["mixture"], fakes, audios[module.target_instrument], reverse_fakes], "i b d n -> (b i) d n")
+                reals_fakes = rearrange([audios["mixture"], audios[module.target_instrument], fakes.cpu()], "i b d n -> (b i) d n")
                 reals_fakes = rearrange(reals_fakes, "b d n -> d (b n)")
                 
                 log_dict = {}
@@ -301,7 +301,9 @@ class DiffusionMSSDemoCallback(pl.Callback):
                 reals_fakes = reals_fakes.to(torch.float32).clamp(-1, 1).mul(32767).to(torch.int16).cpu()
                 torchaudio.save(filename, reals_fakes, self.sample_rate)
                 
-                log_dict[f"mss_cfg_{cfg_scale}"] = wandb.Audio(filename, sample_rate=self.sample_rate, caption=f"MSS_cfg_{cfg_scale}")
+                log_dict[f"mss_cfg_{cfg_scale}"] = wandb.Audio(filename, sample_rate=self.sample_rate, caption=f"Mixture, Real, Fake")
+                
+                log_dict[f"mss_melspec_cfg_{cfg_scale}"] = wandb.Image(audio_spectrogram_image(reals_fakes, sample_rate=self.sample_rate))
                 
                 trainer.logger.experiment.log(log_dict, step=trainer.global_step)
         

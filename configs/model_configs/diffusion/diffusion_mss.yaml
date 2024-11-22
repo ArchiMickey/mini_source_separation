@@ -14,12 +14,13 @@ model:
     input_concat_ids: [mixture]
     type: dit
     diffusion_objective: rectified_flow
+    timestep_sampler: logit_normal
     config:
       io_channels: 64
-      embed_dim: 1024
+      embed_dim: 1152
       input_concat_dim: 64
-      depth: 16
-      num_heads: 16
+      depth: 24
+      num_heads: 24
       transformer_type: continuous_transformer
       attn_kwargs:
         qk_norm: rms
@@ -30,10 +31,10 @@ training:
   optimizer_configs:
     diffusion:
       optimizer:
-        type: AdamW
+        type: PagedAdEMAMix8bit
         config:
-          lr: 1e-4
-          betas: [0.9, 0.999]
+          lr: 5.e-5
+          betas: [0.9, 0.999, 0.9999]
           weight_decay: 1e-3
       scheduler:
         type: InverseLR
