@@ -5,7 +5,7 @@ import torchaudio
 from einops import rearrange
 import numpy as np
 
-from models.fourier import Fourier
+from mss.models.fourier import Fourier
 
 
 class UNet(Fourier):

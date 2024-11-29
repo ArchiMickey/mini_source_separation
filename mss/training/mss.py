@@ -16,8 +16,9 @@ from pathlib import Path
 import os
 from tqdm.auto import tqdm
 from einops import rearrange
+from aeiou.viz import audio_spectrogram_image
 
-from models.fourier import Fourier
+from mss.models.fourier import Fourier
 from data.dataset import load
 from .losses.auraloss import MultiResolutionSTFTLoss, SumAndDifferenceSTFTLoss
 from .losses.losses import L1Loss, AuralossLoss, MultiLoss
@@ -267,6 +268,7 @@ class MSSDemoCallback(pl.Callback):
             torchaudio.save(filename, reals_fakes, self.sample_rate)
             
             log_dict["mss"] = wandb.Audio(filename, sample_rate=self.sample_rate, caption="MSS")
+            log_dict["mss_mel"] = wandb.Image(audio_spectrogram_image(reals_fakes, sample_rate=self.sample_rate))
             
             trainer.logger.experiment.log(log_dict)
         

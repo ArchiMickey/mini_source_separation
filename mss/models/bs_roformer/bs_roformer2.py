@@ -7,7 +7,7 @@ from einops import rearrange
 import numpy as np
 from rotary_embedding_torch import RotaryEmbedding
 
-from models.fourier import Fourier
+from mss.models.fourier import Fourier
 
 
 FREQ_NUM_PER_BANDS = [
@@ -22,12 +22,11 @@ FREQ_NUM_PER_BANDS = [
 ]
 
 
-class BSRoformer(Fourier):
+class BSRoformer2(Fourier):
     def __init__(
         self,
         n_fft: int = 2048,
         hop_length: int = 441,
-        time_stacks: int = 4,
         depth: int = 12,
         dim: int = 384,
         n_heads: int = 12
@@ -40,7 +39,7 @@ class BSRoformer(Fourier):
 
         self.cmplx_num = 2
         self.audio_channels = 2
-        self.time_stacks = time_stacks
+        self.time_stacks = 1
         
         self.head_dim = self.dim // self.n_heads
 

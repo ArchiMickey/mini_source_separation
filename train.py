@@ -10,10 +10,10 @@ from icecream import install
 install()
 
 from data.dataset import create_dataloader_from_config
-from models import create_model_from_config
-from models.utils import load_ckpt_state_dict
-from training import create_training_wrapper_from_config, create_validation_callback_from_config, create_demo_callback_from_config
-from training.utils import copy_state_dict
+from mss.models import create_model_from_config
+from mss.models.utils import load_ckpt_state_dict
+from mss.training import create_training_wrapper_from_config, create_validation_callback_from_config, create_demo_callback_from_config
+from mss.training.utils import copy_state_dict
 
 class ExceptionCallback(pl.Callback):
     def on_exception(self, trainer, module, err):
@@ -40,7 +40,7 @@ def main(cfg):
     
     model = create_model_from_config(model_config)
     
-    model_summary_callback = pl.callbacks.ModelSummary(max_depth=3)
+    model_summary_callback = pl.callbacks.ModelSummary()
     
     training_wrapper = create_training_wrapper_from_config(model_config, model)
     
@@ -71,7 +71,7 @@ def main(cfg):
     
     callbacks = [ckpt_callback, demo_callback, exc_callback, model_summary_callback, save_model_config_callback]
     
-    if cfg.get("validation", None):
+    if "validation" in model_config:
         callbacks += [create_validation_callback_from_config(model_config)]
     
     trainer = pl.Trainer(

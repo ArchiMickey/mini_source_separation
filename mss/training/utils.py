@@ -14,6 +14,67 @@ def get_rank():
     
     return torch.distributed.get_rank()
 
+class NoamLR(torch.optim.lr_scheduler._LRScheduler):
+    """Implements the Noam Learning Rate Schedule.
+
+    Args:
+        optimizer (Optimizer): Wrapped optimizer.
+        warmup_steps (int): Number of steps for the warmup phase. Default: 4000.
+        last_epoch (int): The index of last epoch. Default: -1.
+        verbose (bool): If ``True``, prints a message to stdout for
+            each update. Default: ``False``.
+    """
+
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        warmup_steps: int = 25000,
+        last_epoch: int = -1,
+    ):
+        self.warmup_steps = warmup_steps
+
+        # __init__() must be invoked before setting field
+        # because step() is also invoked in __init__()
+        super().__init__(optimizer, last_epoch)
+
+    def __repr__(self):
+        return f"{self.__class__.__name__}(warmup_steps={self.warmup_steps})"
+
+    def get_lr(self):
+        step_num = self.last_epoch + 1
+        return [
+            lr
+            * self.warmup_steps**0.5
+            * min(step_num**-0.5, step_num * self.warmup_steps**-1.5)
+            for lr in self.base_lrs
+        ]
+
+class CosineDecayLR(torch.optim.lr_scheduler._LRScheduler):
+    """Implements a cosine decay learning rate schedule with linear warmup.
+
+    Args:
+        optimizer (Optimizer): Wrapped optimizer.
+        warmup_steps (int): Number of steps for the warmup phase. Default: 4000.
+        total_steps (int): Total number of steps for the decay phase.
+        last_epoch (int): The index of last epoch. Default: -1.
+        verbose (bool): If ``True``, prints a message to stdout for
+            each update. Default: ``False``.
+    """
+
+    def __init__(self, optimizer, warmup_steps=4000, total_steps=100000, last_epoch=-1, verbose=False):
+        self.warmup_steps = warmup_steps
+        self.total_steps = total_steps
+        super().__init__(optimizer, last_epoch, verbose)
+
+    def get_lr(self):
+        step_num = self.last_epoch + 1
+        if step_num < self.warmup_steps:
+            return [base_lr * step_num / self.warmup_steps for base_lr in self.base_lrs]
+        else:
+            progress = (step_num - self.warmup_steps) / (self.total_steps - self.warmup_steps)
+            cosine_decay = 0.5 * (1 + torch.cos(torch.tensor(progress * torch.pi)))
+            return [base_lr * cosine_decay for base_lr in self.base_lrs]
+
 class InverseLR(torch.optim.lr_scheduler._LRScheduler):
     """Implements an inverse decay learning rate schedule with an optional exponential
     warmup. When last_epoch=-1, sets initial lr as lr.
@@ -105,6 +166,10 @@ def create_scheduler_from_config(scheduler_config, optimizer):
     """
     if scheduler_config["type"] == "InverseLR":
         scheduler_fn = InverseLR
+    elif scheduler_config["type"] == "NoamLR":
+        scheduler_fn = NoamLR
+    elif scheduler_config["type"] == "CosineDecayLR":
+        scheduler_fn = CosineDecayLR
     else:
         scheduler_fn = getattr(torch.optim.lr_scheduler, scheduler_config["type"])
     scheduler = scheduler_fn(optimizer, **scheduler_config["config"])

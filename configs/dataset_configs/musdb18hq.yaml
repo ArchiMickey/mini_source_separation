@@ -5,7 +5,7 @@ train:
   config:
     audio:
       sample_rate: 44100
-      chunk_size: 88064
+      chunk_size: 88200
       min_mean_abs: 0.001
     instruments: [vocals, bass, drums, other]
     target_instrument: vocals
@@ -23,7 +23,7 @@ test:
   config:
     audio:
       sample_rate: 44100
-      chunk_size: 88064
+      chunk_size: 88200
       min_mean_abs: 0.001
     instruments: [vocals, bass, drums, other]
     target_instrument: vocals

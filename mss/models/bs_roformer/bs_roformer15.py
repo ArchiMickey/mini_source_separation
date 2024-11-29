@@ -7,7 +7,7 @@ import numpy as np
 import librosa
 from rotary_embedding_torch import RotaryEmbedding, apply_rotary_emb
 
-from models.fourier import Fourier
+from mss.models.fourier import Fourier
 
 
 class BSRoformer15a(Fourier):
@@ -18,6 +18,7 @@ class BSRoformer15a(Fourier):
         n_fft: int = 2048,
         hop_length: int = 441,
         input_channels: int = 2,
+        patch_size: list = [4, 1],
         depth: int = 12,
         dim: int = 384,
         n_heads: int = 12
@@ -33,9 +34,7 @@ class BSRoformer15a(Fourier):
         
         self.head_dim = self.dim // self.n_heads
 
-        self.patch_size = (4, 1)
-        sr = 44100
-        mel_bins = 256
+        self.patch_size = patch_size
         out_channels = mel_bins // self.patch_size[0]
 
         self.stft_to_image = StftToImage(
@@ -82,6 +81,8 @@ class BSRoformer15a(Fourier):
             z: complex_num=2
         """
         
+        import pdb; pdb.set_trace()
+         
         # Complex spectrum.
         complex_sp = self.stft(mixture)
         # shape: (b, c, t, f)
@@ -333,3 +334,11 @@ class TransformerBlock(nn.Module):
         x = x + self.att(self.att_norm(x))
         x = x + self.mlp(self.ffn_norm(x))
         return x
+
+if __name__ == "__main__":
+    model = BSRoformer15a()
+    print(model)
+    mixture = torch.randn(2, 2, 44100*2)
+    output = model(mixture)
+    print(output.shape)
+    print(output)

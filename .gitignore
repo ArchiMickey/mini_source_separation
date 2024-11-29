@@ -4,3 +4,7 @@ outputs
 pretrained/*/*
 *.ckpt
 *.wav
+uv.lock
+hello.py
+*.egg-info
+*.pkl
