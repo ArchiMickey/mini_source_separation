@@ -1,0 +1,66 @@
+model_type: bsroformer
+sample_rate: 44100
+mono: false
+
+model:
+  _target_: mss.models.bs_roformer.bs_roformer_bsunet.BSRoformerUNet
+  input_channels: 2
+  sr: ${sample_rate}
+  mel_bins: 256
+  n_fft: 2048
+  hop_length: 441 
+  channels: 128
+  channel_multipliers: [1, 2, 4]
+  block_types: [resblock, resblock, bsroformer]
+  depths: [2, 2, 3]
+  n_heads: 8
+  # checkpoint: true
+
+training:
+  use_ema: true
+  optimizer_configs:
+    mss:
+      optimizer:
+        type: AdamW8bit
+        config:
+          lr: 5e-5
+          betas: [0.9, 0.999]
+          weight_decay: 1e-3
+      scheduler:
+        type: InverseLR
+        config:
+          inv_gamma: 1000000
+          power: 0.5
+          warmup: 0.99
+  loss_configs:
+    spectral:
+      type: mrstft
+      config:
+        fft_sizes: [2048, 2048, 2048, 2048]
+        hop_sizes: [147, 147, 147, 147]
+        win_lengths: [2048, 1024, 512, 256]
+        w_sc: 0.
+        w_log_mag: 0.
+        w_lin_mag: 1.
+      weights:
+        mrstft: 0.5
+
+    time:
+      type: l1
+      weights:
+        l1: 1.
+  
+demo:
+  sample_rate: ${sample_rate}
+  demo_every: 2000
+
+validation:
+  validate_every: 5000
+  root: /datasets/musdb18hq
+  splits: [train, test]
+  sr: ${sample_rate}
+  clip_duration: 2.
+  evaluate_num: 10
+  source_types: [vocals, drums, bass, other]
+  target_source_type: vocals
+  batch_size: 8

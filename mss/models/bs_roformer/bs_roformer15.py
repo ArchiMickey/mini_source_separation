@@ -81,8 +81,6 @@ class BSRoformer15a(Fourier):
             z: complex_num=2
         """
         
-        import pdb; pdb.set_trace()
-         
         # Complex spectrum.
         complex_sp = self.stft(mixture)
         # shape: (b, c, t, f)
