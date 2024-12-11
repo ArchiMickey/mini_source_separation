@@ -2,8 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio
-from einops import rearrange, repeat
-from einops.layers.torch import Rearrange
+from einops import rearrange
+from einops.layers.torch import Rearrange, Reduce
 import math
 import numpy as np
 import librosa
@@ -29,12 +29,12 @@ class BSRoformerUNet(Fourier):
         input_channels: int = 2,
         channels: int = 128,
         channel_multipliers: List[int] = [1, 2, 2, 4],
-        block_types: List[str] = ["resblock", "resblock", "bsroformer", "bsroformer"],
+        block_types: List[str] = ["resblock", "resblock", "resblock+bst", "resblock+bst"],
         depths: List[int] = [1, 1, 1, 1],
         downsample_type: str = "Conv",
         upsample_type: str = "InterpolateConv",
         n_heads: int = 4,
-        mid_tf_layers: int = 1,
+        tf_layers: int = 1,
         checkpoint=False
     ):
         super().__init__(n_fft, hop_length)
@@ -55,7 +55,7 @@ class BSRoformerUNet(Fourier):
             downsample_type=downsample_type,
             upsample_type=upsample_type,
             n_heads=n_heads,
-            mid_tf_layers=mid_tf_layers,
+            tf_layers=tf_layers,
             checkpoint=checkpoint
         )
 
@@ -198,6 +198,163 @@ class StftToImage(nn.Module):
 
         return y
 
+class UNetModel(nn.Module):
+    """
+    ## U-Net model
+    """
+
+    def __init__(
+            self, *,
+            in_channels: int,
+            out_channels: int,
+            channels: int,
+            channel_multipliers: List[int],
+            block_types: List[str],
+            depths: List[int],
+            downsample_type: str = "Conv",
+            upsample_type: str = "InterpolateConv",
+            n_heads: int,
+            tf_layers: int=1,
+            checkpoint=False
+        ):
+        """
+        :param in_channels: is the number of channels in the input feature map
+        :param out_channels: is the number of channels in the output feature map
+        :param channels: is the base channel count for the model
+        :param n_res_blocks: number of residual blocks at each level
+        :param attention_levels: are the levels at which attention should be performed
+        :param channel_multipliers: are the multiplicative factors for number of channels for each level
+        :param n_heads: is the number of attention heads in the transformers
+        :param tf_layers: is the number of transformer layers in the transformers
+        :param d_cond: is the size of the conditional embedding in the transformers
+        """
+        super().__init__()
+        self.channels = channels
+        
+        assert len(channel_multipliers) == len(depths) == len(block_types)
+
+        # Number of levels
+        levels = len(channel_multipliers)
+        self.downsample_factor = 2 ** (levels - 1)
+
+        # Input half of the U-Net
+        self.input_blocks = nn.ModuleList()
+        
+        self.input_blocks.append(nn.Sequential(
+            nn.Conv2d(in_channels, channels, 3, padding=1)))
+        # Number of channels at each block in the input half of U-Net
+        input_block_channels = [channels]
+        # Number of channels at each level
+        channels_list = [channels * m for m in channel_multipliers]
+        
+        # Prepare levels
+        for i in range(levels):
+            # Add the residual blocks and attentions
+            for _ in range(depths[i]):
+                # Residual block maps from previous number of channels to the number of
+                # channels in the current level
+                if block_types[i] == "resblock":
+                    layers = [ResBlock(channels, out_channels=channels_list[i])]
+                elif block_types[i] == "resblock+bst":
+                    layers = [ResBlock(channels, out_channels=channels_list[i])]
+                    layers.append(BSTransformer(channels_list[i], n_heads, tf_layers))
+                else:
+                    raise ValueError(f"Invalid block type: {block_types[i]}")
+                
+                channels = channels_list[i]
+                
+                # Add them to the input half of the U-Net and keep track of the number of channels of
+                # its output
+                self.input_blocks.append(nn.Sequential(*layers))
+                input_block_channels.append(channels)
+            # Down sample at all levels except last
+            if i != levels - 1:
+                if downsample_type == "Conv":
+                    self.input_blocks.append(nn.Sequential(DownSample(channels)))
+                elif downsample_type == "AveragingConv":
+                    self.input_blocks.append(nn.Sequential(ResidualBlock(DownSample(channels), PixelUnshuffleChannelAveragingDownSampleLayer(channels, channels, 2))))
+                else:
+                    raise ValueError(f"Invalid downsample type: {downsample_type}")
+                input_block_channels.append(channels)
+
+        self.middle_blocks = nn.Sequential(
+            ResBlock(channels, out_channels=channels),
+            BSTransformer(channels, n_heads, tf_layers),
+            ResBlock(channels, out_channels=channels),
+        )
+        
+        # Second half of the U-Net
+        self.output_blocks = nn.ModuleList([])
+        # Prepare levels in reverse order
+        for i in reversed(range(levels)):
+            # Add the residual blocks and attentions
+            for j in range(depths[i] + 1):
+                # Residual block maps from previous number of channels plus the
+                # skip connections from the input half of U-Net to the number of
+                # channels in the current level.
+                
+                if block_types[i] == "resblock":
+                    layers = [ResBlock(channels + input_block_channels.pop(), out_channels=channels_list[i])]
+                elif block_types[i] == "resblock+bst":
+                    layers = [ResBlock(channels + input_block_channels.pop(), out_channels=channels_list[i])]
+                    layers.append(BSTransformer(channels_list[i], n_heads, tf_layers))
+                else:
+                    raise ValueError(f"Invalid block type: {block_types[i]}")
+                
+                channels = channels_list[i]
+                # Up-sample at every level after last residual block
+                # except the last one.
+                # Note that we are iterating in reverse; i.e. `i == 0` is the last.
+                if i != 0 and j == depths[i]:
+                    if upsample_type == "InterpolateConv":
+                        layers.append(UpSample(channels))
+                    elif upsample_type == "DuplicatingInterpolateConv":
+                        layers.append(ResidualBlock(UpSample(channels), ChannelDuplicatingPixelUnshuffleUpSampleLayer(channels, channels, 2)))
+                    else:
+                        raise ValueError(f"Invalid upsample type: {upsample_type}")
+                # Add to the output half of the U-Net
+                self.output_blocks.append(nn.Sequential(*layers))
+
+        # Final normalization and $3 \times 3$ convolution
+        self.out = nn.Sequential(
+            RMSNorm2d(channels),
+            nn.SiLU(),
+            nn.Conv2d(channels, out_channels, 3, padding=1),
+        )
+        
+        self.checkpoint = checkpoint
+    
+    def forward(self, x: torch.Tensor):
+        """
+        :param x: is the input feature map of shape `[batch_size, channels, width, height]`
+        :param time_steps: are the time steps of shape `[batch_size]`
+        :param cond: conditioning of shape `[batch_size, n_cond, d_cond]`
+        """
+        init_shape = x.shape[-2:]
+        if not all([divisible_by(d, self.downsample_factor) for d in init_shape]):
+            new_shape = [int(np.ceil(d / self.downsample_factor) * self.downsample_factor) for d in init_shape]
+            x = F.pad(x, (0, new_shape[-1] - init_shape[-1], 0, new_shape[-2] - init_shape[-2]))
+        
+        # To store the input half outputs for skip connections
+        x_input_block = []
+        
+        # Input half of the U-Net
+        for module in self.input_blocks:
+            x = checkpoint(module, x) if self.checkpoint else module(x)
+            x_input_block.append(x)
+        
+        # Middle blocks
+        x = checkpoint(self.middle_blocks, x) if self.checkpoint else self.middle_blocks(x)
+        
+        # Output half of the U-Net
+        for module in self.output_blocks:
+            x = torch.cat([x, x_input_block.pop()], dim=1)
+            x = checkpoint(module, x) if self.checkpoint else module(x)
+
+        # Final normalization and $3 \times 3$ convolution
+        x = checkpoint(self.out, x) if self.checkpoint else self.out(x)
+        x = x[..., :init_shape[0], :init_shape[1]]
+        return x
 
 class RMSNorm2d(Module):
     def __init__(self, dim):
@@ -310,186 +467,46 @@ class TransformerBlock(nn.Module):
         x = x + self.mlp(self.ffn_norm(x))
         return x
 
-class BSRoformerBlock(Module):
-    def __init__(self, dim, n_heads, dim_in=None, linear_attn=False):
+class BasicBSTransformerBlock(Module):
+    def __init__(self, dim, n_heads, linear_attn=False):
         super().__init__()
-        self.proj = nn.Linear(dim_in, dim) if dim_in is not None else nn.Identity()
+        self.transformer = TransformerBlock(dim, n_heads=n_heads, linear_attn=True)
         self.transformer_t = TransformerBlock(dim, n_heads=n_heads, linear_attn=linear_attn)
         self.transformer_f = TransformerBlock(dim, n_heads=n_heads, linear_attn=linear_attn)
     
     def forward(self, x):
         x = rearrange(x, "b d t f -> b f t d")
-        x = self.proj(x)
+        b, f, t, d = x.shape
+        x = rearrange(x, "b f t d -> b (f t) d").unsqueeze(1)
+        x = self.transformer(x)
+        x = rearrange(x.squeeze(1), "b (f t) d -> b f t d", f=f, t=t)
         x = self.transformer_t(x)
         x = rearrange(x, "b f t d -> b t f d")
         x = self.transformer_f(x)
         return rearrange(x, "b t f d -> b d t f")
 
+class BSTransformer(Module):
+    def __init__(self, dim, n_heads, n_layers):
+        super().__init__()
+        self.norm = RMSNorm2d(dim)
+        self.proj_in = nn.Conv2d(dim, dim, 1)
+        
+        self.transformer_blocks = nn.ModuleList([BasicBSTransformerBlock(dim, n_heads) for _ in range(n_layers)])
+        
+        self.proj_out = nn.Conv2d(dim, dim, 1)
+    
+    def forward(self, x):
+        x_in = x
+        x = self.norm(x)
+        x = self.proj_in(x)
+        for block in self.transformer_blocks:
+            x = block(x)
+        x = self.proj_out(x)
+        return x + x_in
+        
+
 def divisible_by(numer, denom):
     return (numer % denom) == 0
-
-
-class UNetModel(nn.Module):
-    """
-    ## U-Net model
-    """
-
-    def __init__(
-            self, *,
-            in_channels: int,
-            out_channels: int,
-            channels: int,
-            channel_multipliers: List[int],
-            block_types: List[str],
-            depths: List[int],
-            downsample_type: str = "Conv",
-            upsample_type: str = "InterpolateConv",
-            n_heads: int,
-            mid_tf_layers: int=1,
-            checkpoint=False
-        ):
-        """
-        :param in_channels: is the number of channels in the input feature map
-        :param out_channels: is the number of channels in the output feature map
-        :param channels: is the base channel count for the model
-        :param n_res_blocks: number of residual blocks at each level
-        :param attention_levels: are the levels at which attention should be performed
-        :param channel_multipliers: are the multiplicative factors for number of channels for each level
-        :param n_heads: is the number of attention heads in the transformers
-        :param tf_layers: is the number of transformer layers in the transformers
-        :param d_cond: is the size of the conditional embedding in the transformers
-        """
-        super().__init__()
-        self.channels = channels
-        
-        assert len(channel_multipliers) == len(depths) == len(block_types)
-
-        # Number of levels
-        levels = len(channel_multipliers)
-        self.downsample_factor = 2 ** (levels - 1)
-
-        # Input half of the U-Net
-        self.input_blocks = nn.ModuleList()
-        
-        self.input_blocks.append(nn.Sequential(
-            nn.Conv2d(in_channels, channels, 3, padding=1)))
-        # Number of channels at each block in the input half of U-Net
-        input_block_channels = [channels]
-        # Number of channels at each level
-        channels_list = [channels * m for m in channel_multipliers]
-        
-        # Prepare levels
-        for i in range(levels):
-            # Add the residual blocks and attentions
-            for _ in range(depths[i]):
-                # Residual block maps from previous number of channels to the number of
-                # channels in the current level
-                
-                if block_types[i] == "resblock":
-                    layers = [ResBlock(channels, out_channels=channels_list[i])]
-                elif block_types[i] == "bsroformer":
-                    layers = [BSRoformerBlock(channels_list[i], dim_in=channels,  n_heads=n_heads, linear_attn=False)]
-                elif block_types[i] == "linear_bsroformer":
-                    layers = [BSRoformerBlock(channels_list[i], dim_in=channels,  n_heads=n_heads, linear_attn=True)]
-                else:
-                    raise ValueError(f"Invalid block type: {block_types[i]}")
-                
-                channels = channels_list[i]
-                
-                # Add them to the input half of the U-Net and keep track of the number of channels of
-                # its output
-                self.input_blocks.append(nn.Sequential(*layers))
-                input_block_channels.append(channels)
-            # Down sample at all levels except last
-            if i != levels - 1:
-                if downsample_type == "Conv":
-                    self.input_blocks.append(nn.Sequential(DownSample(channels)))
-                elif downsample_type == "AveragingConv":
-                    self.input_blocks.append(nn.Sequential(ResidualBlock(DownSample(channels), PixelUnshuffleChannelAveragingDownSampleLayer(channels, channels, 2))))
-                else:
-                    raise ValueError(f"Invalid downsample type: {downsample_type}")
-                input_block_channels.append(channels)
-
-        self.middle_blocks = nn.Sequential(
-            ResBlock(channels, out_channels=channels),
-            *[BSRoformerBlock(channels, n_heads=n_heads) for _ in range(mid_tf_layers)],
-            ResBlock(channels, out_channels=channels),
-        )
-        
-        # Second half of the U-Net
-        self.output_blocks = nn.ModuleList([])
-        # Prepare levels in reverse order
-        for i in reversed(range(levels)):
-            # Add the residual blocks and attentions
-            for j in range(depths[i] + 1):
-                # Residual block maps from previous number of channels plus the
-                # skip connections from the input half of U-Net to the number of
-                # channels in the current level.
-                
-                if block_types[i] == "resblock":
-                    layers = [ResBlock(channels + input_block_channels.pop(), out_channels=channels_list[i])]
-                elif block_types[i] == "bsroformer":
-                    layers = [BSRoformerBlock(channels_list[i], dim_in=channels + input_block_channels.pop(),  n_heads=n_heads, linear_attn=False)]
-                elif block_types[i] == "linear_bsroformer":
-                    layers = [BSRoformerBlock(channels_list[i], dim_in=channels + input_block_channels.pop(),  n_heads=n_heads, linear_attn=True)]
-                else:
-                    raise ValueError(f"Invalid block type: {block_types[i]}")
-                
-                channels = channels_list[i]
-                # Up-sample at every level after last residual block
-                # except the last one.
-                # Note that we are iterating in reverse; i.e. `i == 0` is the last.
-                if i != 0 and j == depths[i]:
-                    if upsample_type == "InterpolateConv":
-                        layers.append(UpSample(channels))
-                    elif upsample_type == "DuplicatingInterpolateConv":
-                        layers.append(ResidualBlock(UpSample(channels), ChannelDuplicatingPixelUnshuffleUpSampleLayer(channels, channels, 2)))
-                    else:
-                        raise ValueError(f"Invalid upsample type: {upsample_type}")
-                # Add to the output half of the U-Net
-                self.output_blocks.append(nn.Sequential(*layers))
-
-        # Final normalization and $3 \times 3$ convolution
-        self.out = nn.Sequential(
-            RMSNorm2d(channels),
-            nn.SiLU(),
-            nn.Conv2d(channels, out_channels, 3, padding=1),
-        )
-        
-        self.checkpoint = checkpoint
-
-    def forward(self, x: torch.Tensor):
-        """
-        :param x: is the input feature map of shape `[batch_size, channels, width, height]`
-        :param time_steps: are the time steps of shape `[batch_size]`
-        :param cond: conditioning of shape `[batch_size, n_cond, d_cond]`
-        """
-        init_shape = x.shape[-2:]
-        if not all([divisible_by(d, self.downsample_factor) for d in init_shape]):
-            new_shape = [int(np.ceil(d / self.downsample_factor) * self.downsample_factor) for d in init_shape]
-            x = F.pad(x, (0, new_shape[-1] - init_shape[-1], 0, new_shape[-2] - init_shape[-2]))
-        
-        # To store the input half outputs for skip connections
-        x_input_block = []
-        
-        # Input half of the U-Net
-        for module in self.input_blocks:
-            x = checkpoint(module, x) if self.checkpoint else module(x)
-            x_input_block.append(x)
-        
-        # Middle blocks
-        x = checkpoint(self.middle_blocks, x) if self.checkpoint else self.middle_blocks(x)
-        
-        # Output half of the U-Net
-        for module in self.output_blocks:
-            x = torch.cat([x, x_input_block.pop()], dim=1)
-            x = checkpoint(module, x) if self.checkpoint else module(x)
-
-        # Final normalization and $3 \times 3$ convolution
-        x = checkpoint(self.out, x) if self.checkpoint else self.out(x)
-        x = x[..., :init_shape[0], :init_shape[1]]
-        return x
-
 
 class UpSample(nn.Module):
     """
@@ -642,7 +659,7 @@ class ResBlock(nn.Module):
         return self.skip_connection(x) + h
 
 if __name__ == "__main__":
-    model = BSRoformerUNet(channels=32, downsample_type="AveragingConv", upsample_type="DuplicatingInterpolateConv")
+    model = BSRoformerUNet(channels=32)
     print(model)
     mixture = torch.randn(2, 2, 44100*2)
     output = model(mixture)
