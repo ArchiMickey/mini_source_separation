@@ -1,5 +1,5 @@
 train:
-  _target_: data.dataset.MSSDataset
+  _target_: mss.data.dataset.MSSDataset
   data_path: /datasets/musdb18hq/train
   metadata_path: metadata/musdb18hq_train.pkl
   config:
@@ -17,7 +17,7 @@ train:
       loudness_max: 1.5
 
 test:
-  _target_: data.dataset.MSSDataset
+  _target_: mss.data.dataset.MSSDataset
   data_path: /datasets/musdb18hq/test
   metadata_path: metadata/musdb18hq_test.pkl
   config:
