@@ -2,6 +2,6 @@
 	path = mss/third_party/BigVGAN
 	url = https://github.com/NVIDIA/BigVGAN.git
 
-[submodule "mss/third_party/stable-audio-tools"]
-    path = mss/third_party/stable-audio-tools
-    url = https://github.com/Stability-AI/stable-audio-tools.git
+[submodule "mss/third_party/stable_audio_tools"]
+	path = mss/third_party/stable_audio_tools
+	url = https://github.com/ArchiMickey/stable-audio-tools.git
