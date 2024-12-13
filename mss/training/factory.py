@@ -14,7 +14,7 @@ def create_training_wrapper_from_config(model_config, model):
             cfg_dropout_prob=training_config.get("cfg_dropout_prob", 0.1),
             timestep_sampler=training_config.get("timestep_sampler", "logit_normal"),
         )
-    elif model_type == "bsroformer":
+    elif model_type in ["bsroformer", "latentmss_transformer"]:
         from .mss import MSSTrainingWrapper
 
         return MSSTrainingWrapper(
@@ -38,6 +38,9 @@ def create_training_wrapper_from_config(model_config, model):
             use_ema=training_config.get("use_ema", True),
             optimizer_configs=training_config.get("optimizer_configs", None),
         )
+    
+    else:
+        raise NotImplementedError(f"Model type {model_type} not implemented")
 
 def create_demo_callback_from_config(model_config, **kwargs):
     model_type = model_config.get('model_type', None)
@@ -50,7 +53,7 @@ def create_demo_callback_from_config(model_config, **kwargs):
         return DiffusionMSSDemoCallback(
             **demo_config, **kwargs
         )
-    elif model_type == "bsroformer":
+    elif model_type in ["bsroformer", "latentmss_transformer"]:
         from .mss import MSSDemoCallback
         
         return MSSDemoCallback(
@@ -62,6 +65,8 @@ def create_demo_callback_from_config(model_config, **kwargs):
         return MSSDemoCallback(
             **demo_config, **kwargs
         )
+    else:
+        raise NotImplementedError(f"Model type {model_type} not implemented")
 
 def create_validation_callback_from_config(model_config, **kwargs):
     model_type = model_config.get('model_type', None)
@@ -70,7 +75,7 @@ def create_validation_callback_from_config(model_config, **kwargs):
     val_config = model_config.get('validation', None)
     assert val_config is not None, 'validation config must be specified in model config'
     
-    if model_type == "bsroformer":
+    if model_type in ["bsroformer", "latentmss_transformer"]:
         from .mss import MSSValidateCallback
         
         return MSSValidateCallback(
@@ -82,3 +87,5 @@ def create_validation_callback_from_config(model_config, **kwargs):
         return MSSValidateCallback(
             **val_config, **kwargs
         )
+    else:
+        raise NotImplementedError(f"Model type {model_type} not implemented")
