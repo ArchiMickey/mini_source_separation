@@ -12,7 +12,7 @@ model:
   channels: 128
   channel_multipliers: [1, 2, 4, 4]
   block_types: [resblock, resblock, resblock+bst, resblock+bst]
-  depths: [2, 2, 3, 3]
+  depths: [2, 2, 2, 3]
   n_heads: 8
   tf_layers: 1
   checkpoint: false
@@ -35,11 +35,11 @@ training:
   
 demo:
   sample_rate: ${sample_rate}
-  sample_steps: 5
-  demo_every: 1
+  sample_steps: 25
+  demo_every: 2000
 
 validation:
-  validate_every: 1
+  validate_every: 10000
   root: /datasets/musdb18hq
   splits: [train, test]
   sr: ${sample_rate}

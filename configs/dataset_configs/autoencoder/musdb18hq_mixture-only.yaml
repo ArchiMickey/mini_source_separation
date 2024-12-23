@@ -1,0 +1,6 @@
+dataset_type: audio_dir
+datasets:
+  - id: musdbhq18
+    path: /root/autodl-tmp/musdb18hq_mixture-only
+random_crop: true
+repeat: 1000

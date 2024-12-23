@@ -9,7 +9,8 @@ import hydra
 from icecream import install
 install()
 
-from data.dataset import create_dataloader_from_config
+from mss.data.dataset import create_dataloader_from_config
+from mss.models.autoencoder.stable_audio_tools.data.dataset import create_dataloader_from_config as create_ae_dataloader_from_config
 from mss.models import create_model_from_config
 from mss.models.utils import load_ckpt_state_dict
 from mss.training import create_training_wrapper_from_config, create_validation_callback_from_config, create_demo_callback_from_config
@@ -36,7 +37,10 @@ def main(cfg):
     model_config = OmegaConf.load(cfg.model_config)
     dataset_config = OmegaConf.load(cfg.dataset_config)
     
-    train_dl = create_dataloader_from_config(dataset_config["train"], batch_size=cfg.batch_size, num_workers=cfg.num_workers)
+    if model_config["model_type"] in ["autoencoder", "autoencoder_v2"]:
+        train_dl = create_ae_dataloader_from_config(dataset_config, batch_size=cfg.batch_size, sample_size=model_config.sample_size, sample_rate=model_config.sample_rate, num_workers=cfg.num_workers)
+    else:
+        train_dl = create_dataloader_from_config(dataset_config["train"], batch_size=cfg.batch_size, num_workers=cfg.num_workers)
     
     model = create_model_from_config(model_config)
     
@@ -45,7 +49,6 @@ def main(cfg):
     training_wrapper = create_training_wrapper_from_config(model_config, model)
     
     wandb_logger = pl.loggers.WandbLogger(project=cfg.name, name=cfg.get("run_name", None))
-    wandb_logger.watch(training_wrapper)
     
     exc_callback = ExceptionCallback()
     
@@ -66,8 +69,11 @@ def main(cfg):
         strategy = cfg.strategy
     else:
         strategy = 'ddp_find_unused_parameters_true' if cfg.num_gpus > 1 else "auto"
-        
-    demo_callback = create_demo_callback_from_config(model_config, demo_dl=create_dataloader_from_config(dataset_config["test"], batch_size=8, num_workers=cfg.num_workers))
+    
+    if model_config["model_type"] in ["autoencoder", "autoencoder_v2"]:
+        demo_callback = create_demo_callback_from_config(model_config, demo_dl=train_dl)
+    else:
+        demo_callback = create_demo_callback_from_config(model_config, demo_dl=create_dataloader_from_config(dataset_config["test"], batch_size=8, num_workers=cfg.num_workers))
     
     callbacks = [ckpt_callback, demo_callback, exc_callback, model_summary_callback, save_model_config_callback]
     
@@ -87,7 +93,7 @@ def main(cfg):
         max_epochs=cfg.get("max_epochs", None),
         max_steps=cfg.get("max_steps", None),
         default_root_dir=cfg.save_dir,
-        gradient_clip_val=cfg.gradient_clip_val,
+        gradient_clip_val=cfg.gradient_clip_val if 'autoencoder' not in model_config["model_type"] else None,
         use_distributed_sampler=False
     )
     
