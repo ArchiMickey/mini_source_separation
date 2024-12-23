@@ -15,7 +15,6 @@ from ..models.autoencoder.stable_audio_tools.training.losses import MultiLoss, A
 from .losses.losses import MultiScaleMelSpectrogramLoss
 from ..models.autoencoder.stable_audio_tools.training.utils import create_optimizer_from_config, create_scheduler_from_config
 
-from autoclip.torch import QuantileClip
 from pytorch_lightning.utilities.rank_zero import rank_zero_only
 from pytorch_lightning.utilities import grad_norm
 from aeiou.viz import pca_point_cloud, audio_spectrogram_image, tokens_spectrogram_image
@@ -347,7 +346,8 @@ class AutoencoderTrainingWrapper(pl.LightningModule):
 
             opt_disc.zero_grad()
             self.manual_backward(loss)
-            disc_grad_norms = grad_norm(self.discriminator, norm_type=2, group_separator='_disc/')
+            disc_grad_norms = grad_norm(self.discriminator, norm_type=2)
+            disc_grad_norms = {f'disc_{k}': v for k, v in disc_grad_norms.items()}
             self.log_dict(disc_grad_norms, on_step=True)
             opt_disc.step()
 
@@ -367,7 +367,8 @@ class AutoencoderTrainingWrapper(pl.LightningModule):
 
         opt_gen.zero_grad()
         self.manual_backward(loss)
-        gen_grad_norms = grad_norm(self.autoencoder, norm_type=2, group_separator='_gen/')
+        gen_grad_norms = grad_norm(self.autoencoder, norm_type=2)
+        gen_grad_norms = {f'gen_{k}': v for k, v in gen_grad_norms.items()}
         self.log_dict(gen_grad_norms, on_step=True)
         if self.grad_clip_norm > 0.0:
             self.clip_gradients(opt_gen, self.grad_clip_norm, gradient_clip_algorithm='norm')
