@@ -3,6 +3,8 @@ from omegaconf import OmegaConf
 import os
 import torch
 import pytorch_lightning as pl
+from pytorch_lightning.loggers import WandbLogger
+from pytorch_lightning.callbacks import ModelCheckpoint, ModelSummary
 import random
 import hydra
 
@@ -44,11 +46,18 @@ def main(cfg):
     
     model = create_model_from_config(model_config)
     
-    model_summary_callback = pl.callbacks.ModelSummary()
+    if cfg.pretrained_ckpt_path:
+        copy_state_dict(model, load_ckpt_state_dict(cfg.pretrained_ckpt_path))
+    
+    model_summary_callback = ModelSummary()
     
     training_wrapper = create_training_wrapper_from_config(model_config, model)
     
-    wandb_logger = pl.loggers.WandbLogger(project=cfg.name, name=cfg.get("run_name", None))
+    logger_kwargs = {}
+    if cfg.ckpt_path not in [None, ""]:
+        assert cfg.wandb_resume_id is not None, "If you are resuming from a checkpoint, you must provide the wandb resume id"
+        logger_kwargs.update({"resume": "must", "id": cfg.wandb_resume_id})
+    wandb_logger = WandbLogger(project=cfg.name, name=cfg.get("run_name", None), **logger_kwargs)
     
     exc_callback = ExceptionCallback()
     
@@ -57,13 +66,14 @@ def main(cfg):
     else:
         checkpoint_dir = None
     
-    ckpt_callback = pl.callbacks.ModelCheckpoint(every_n_train_steps=cfg.checkpoint_every, dirpath=checkpoint_dir, save_top_k=-1)
+    ckpt_callback = ModelCheckpoint(every_n_train_steps=cfg.checkpoint_every, dirpath=checkpoint_dir, save_top_k=-1, save_last=True)
     save_model_config_callback = ModelConfigEmbedderCallback(model_config)
     
     args_dict = OmegaConf.to_container(cfg, resolve=True)
     args_dict.update({"model_config": OmegaConf.to_container(model_config, resolve=True)})
     args_dict.update({"dataset_config": OmegaConf.to_container(dataset_config, resolve=True)})
-    push_wandb_config(wandb_logger, args_dict)
+    if hasattr(wandb_logger.experiment.config, 'update'): #On multi-GPU runs, only process rank 0 has this attribute!
+        wandb_logger.experiment.config.update(args_dict, allow_val_change=True)
     
     if cfg.strategy:
         strategy = cfg.strategy
@@ -94,7 +104,8 @@ def main(cfg):
         max_steps=cfg.get("max_steps", None),
         default_root_dir=cfg.save_dir,
         gradient_clip_val=cfg.gradient_clip_val if 'autoencoder' not in model_config["model_type"] else None,
-        use_distributed_sampler=False
+        use_distributed_sampler=False,
+        limit_train_batches=cfg.limit_train_batches,
     )
     
     trainer.fit(training_wrapper, train_dl, ckpt_path=cfg.ckpt_path if cfg.ckpt_path else None)

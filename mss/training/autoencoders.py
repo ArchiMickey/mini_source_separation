@@ -9,7 +9,7 @@ from ..models.autoencoder.stable_audio_tools.training.losses.auraloss import Sum
 import pytorch_lightning as pl
 from ..models.autoencoder.stable_audio_tools.models.autoencoders import AudioAutoencoder
 from ..models.autoencoder.stable_audio_tools.models.discriminators import EncodecDiscriminator, OobleckDiscriminator, DACGANLoss
-from ..models.autoencoder.discriminators import MultiScaleSubbandCQTDiscriminator
+from ..models.autoencoder.discriminators import MultiPeriodDiscriminator, MultiScaleSubbandCQTDiscriminator, CombinedDiscriminator
 from ..models.autoencoder.stable_audio_tools.models.bottleneck import VAEBottleneck, RVQBottleneck, DACRVQBottleneck, DACRVQVAEBottleneck, RVQVAEBottleneck, WassersteinBottleneck
 from ..models.autoencoder.stable_audio_tools.training.losses import MultiLoss, AuralossLoss, ValueLoss, L1Loss
 from .losses.losses import MultiScaleMelSpectrogramLoss
@@ -134,7 +134,12 @@ class AutoencoderTrainingWrapper(pl.LightningModule):
         elif loss_config['discriminator']['type'] == 'dac':
             self.discriminator = DACGANLoss(channels=self.autoencoder.out_channels, sample_rate=sample_rate, **loss_config['discriminator']['config'])
         elif loss_config['discriminator']['type'] == 'mscqt':
-            self.discriminator = MultiScaleSubbandCQTDiscriminator(in_channels=self.autoencoder.in_channels, out_channels=self.autoencoder.out_channels, **loss_config['discriminator']['config'])
+            self.discriminator = MultiScaleSubbandCQTDiscriminator(in_channels=self.autoencoder.in_channels, **loss_config['discriminator']['config'])
+        elif loss_config['discriminator']['type'] == 'mpd':
+            self.discriminator = MultiPeriodDiscriminator(in_channels=self.autoencoder.in_channels, **loss_config['discriminator']['config'])
+        elif loss_config['discriminator']['type'] == 'combined':
+            assert len(loss_config['discriminator']['config']) > 0, "Combined discriminator requires a list of discriminators config dicts"
+            self.discriminator = CombinedDiscriminator(loss_config['discriminator']['config'])
 
         self.gen_loss_modules = []
 
@@ -346,9 +351,10 @@ class AutoencoderTrainingWrapper(pl.LightningModule):
 
             opt_disc.zero_grad()
             self.manual_backward(loss)
-            disc_grad_norms = grad_norm(self.discriminator, norm_type=2)
-            disc_grad_norms = {f'disc_{k}': v for k, v in disc_grad_norms.items()}
-            self.log_dict(disc_grad_norms, on_step=True)
+            if self.global_step % 25 == 0:
+                disc_grad_norms = grad_norm(self.discriminator, norm_type=2)
+                disc_grad_norms = {f'disc_{k}': v for k, v in disc_grad_norms.items()}
+                self.log_dict(disc_grad_norms, on_step=True)
             opt_disc.step()
 
             if sched_disc is not None:
@@ -367,9 +373,10 @@ class AutoencoderTrainingWrapper(pl.LightningModule):
 
         opt_gen.zero_grad()
         self.manual_backward(loss)
-        gen_grad_norms = grad_norm(self.autoencoder, norm_type=2)
-        gen_grad_norms = {f'gen_{k}': v for k, v in gen_grad_norms.items()}
-        self.log_dict(gen_grad_norms, on_step=True)
+        if self.global_step % 25 == 0:
+            gen_grad_norms = grad_norm(self.autoencoder, norm_type=2)
+            gen_grad_norms = {f'gen_{k}': v for k, v in gen_grad_norms.items()}
+            self.log_dict(gen_grad_norms, on_step=True)
         if self.grad_clip_norm > 0.0:
             self.clip_gradients(opt_gen, self.grad_clip_norm, gradient_clip_algorithm='norm')
         opt_gen.step()

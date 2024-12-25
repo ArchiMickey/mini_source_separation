@@ -121,8 +121,8 @@ class MultiScaleMelSpectrogramLoss(LossModule):
 
     def __init__(
         self,
-        key_a: str,
-        key_b: str,
+        input_key: str,
+        target_key: str,
         sampling_rate: int,
         n_mels: List[int] = [5, 10, 20, 40, 80, 160, 320],
         window_lengths: List[int] = [32, 64, 128, 256, 512, 1024, 2048],
@@ -139,8 +139,8 @@ class MultiScaleMelSpectrogramLoss(LossModule):
         name='ms_melspec_loss'
     ):
         super().__init__(name=name, weight=weight)
-        self.key_a = key_a
-        self.key_b = key_b
+        self.input_key = input_key
+        self.target_key = target_key
         self.sampling_rate = sampling_rate
 
         STFTParams = namedtuple(
@@ -255,7 +255,7 @@ class MultiScaleMelSpectrogramLoss(LossModule):
         torch.Tensor
             Mel loss.
         """
-        x, y = info[self.key_a], info[self.key_b]
+        x, y = info[self.input_key], info[self.target_key]
         loss = 0.0
         for n_mels, fmin, fmax, s in zip(
             self.n_mels, self.mel_fmin, self.mel_fmax, self.stft_params

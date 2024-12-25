@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
-from torch.nn.utils import weight_norm
+import torch.nn.functional as F
+from torch.nn import Conv2d
+from torch.nn.utils import weight_norm, spectral_norm
 from torchaudio.transforms import Resample
 
 from .stable_audio_tools.models.discriminators import get_hinge_losses
@@ -8,6 +10,157 @@ from .stable_audio_tools.models.discriminators import get_hinge_losses
 from typing import List, Tuple
 import typing
 
+
+def get_padding(kernel_size, dilation=1):
+    return int((kernel_size * dilation - dilation) / 2)
+
+class DiscriminatorP(torch.nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        discriminator_channel_mult,
+        period: List[int],
+        kernel_size: int = 5,
+        stride: int = 3,
+        use_spectral_norm: bool = False,
+    ):
+        super().__init__()
+        self.period = period
+        self.d_mult = discriminator_channel_mult
+        norm_f = weight_norm if not use_spectral_norm else spectral_norm
+
+        self.convs = nn.ModuleList(
+            [
+                norm_f(
+                    Conv2d(
+                        in_channels,
+                        int(32 * self.d_mult),
+                        (kernel_size, 1),
+                        (stride, 1),
+                        padding=(get_padding(5, 1), 0),
+                    )
+                ),
+                norm_f(
+                    Conv2d(
+                        int(32 * self.d_mult),
+                        int(128 * self.d_mult),
+                        (kernel_size, 1),
+                        (stride, 1),
+                        padding=(get_padding(5, 1), 0),
+                    )
+                ),
+                norm_f(
+                    Conv2d(
+                        int(128 * self.d_mult),
+                        int(512 * self.d_mult),
+                        (kernel_size, 1),
+                        (stride, 1),
+                        padding=(get_padding(5, 1), 0),
+                    )
+                ),
+                norm_f(
+                    Conv2d(
+                        int(512 * self.d_mult),
+                        int(1024 * self.d_mult),
+                        (kernel_size, 1),
+                        (stride, 1),
+                        padding=(get_padding(5, 1), 0),
+                    )
+                ),
+                norm_f(
+                    Conv2d(
+                        int(1024 * self.d_mult),
+                        int(1024 * self.d_mult),
+                        (kernel_size, 1),
+                        1,
+                        padding=(2, 0),
+                    )
+                ),
+            ]
+        )
+        self.conv_post = norm_f(
+            Conv2d(int(1024 * self.d_mult), 1, (3, 1), 1, padding=(1, 0))
+        )
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        fmap = []
+
+        # 1d to 2d
+        b, c, t = x.shape
+        if t % self.period != 0:  # pad first
+            n_pad = self.period - (t % self.period)
+            x = F.pad(x, (0, n_pad), "reflect")
+            t = t + n_pad
+        x = x.view(b, c, t // self.period, self.period)
+
+        for l in self.convs:
+            x = l(x)
+            x = F.leaky_relu(x, 0.1)
+            fmap.append(x)
+        x = self.conv_post(x)
+        fmap.append(x)
+        x = torch.flatten(x, 1, -1)
+
+        return x, fmap
+
+
+class MultiPeriodDiscriminator(torch.nn.Module):
+    def __init__(self, in_channels, mpd_reshapes, discriminator_channel_mult, use_spectral_norm):
+        super().__init__()
+        self.mpd_reshapes = mpd_reshapes
+        print(f"mpd_reshapes: {self.mpd_reshapes}")
+        self.discriminators = nn.ModuleList(
+            [
+                DiscriminatorP(in_channels, discriminator_channel_mult, rs, use_spectral_norm=use_spectral_norm)
+                for rs in self.mpd_reshapes
+            ]
+        )
+
+    def forward(self, y: torch.Tensor, y_hat: torch.Tensor) -> Tuple[
+        List[torch.Tensor],
+        List[torch.Tensor],
+        List[List[torch.Tensor]],
+        List[List[torch.Tensor]],
+    ]:
+        y_d_rs = []
+        y_d_gs = []
+        fmap_rs = []
+        fmap_gs = []
+        for i, d in enumerate(self.discriminators):
+            y_d_r, fmap_r = d(y)
+            y_d_g, fmap_g = d(y_hat)
+            y_d_rs.append(y_d_r)
+            fmap_rs.append(fmap_r)
+            y_d_gs.append(y_d_g)
+            fmap_gs.append(fmap_g)
+
+        return y_d_rs, y_d_gs, fmap_rs, fmap_gs
+    
+    def loss(self, x, y):
+        feature_matching_distance = 0.
+        logits_true, logits_fake, feature_true, feature_fake = self(y, x)
+        
+        dis_loss = torch.tensor(0.)
+        adv_loss = torch.tensor(0.)
+        
+        for i, (scale_true, scale_fake) in enumerate(zip(feature_true, feature_fake)):
+
+            feature_matching_distance = feature_matching_distance + sum(
+                map(
+                    lambda x, y: abs(x - y).mean(),
+                    scale_true,
+                    scale_fake,
+                )) / len(scale_true)
+
+            _dis, _adv = get_hinge_losses(
+                logits_true[i],
+                logits_fake[i],
+            )
+
+            dis_loss = dis_loss + _dis
+            adv_loss = adv_loss + _adv
+
+        return dis_loss, adv_loss, feature_matching_distance
 
 class DiscriminatorCQT(nn.Module):
     def __init__(self, 
@@ -273,3 +426,48 @@ class MultiScaleSubbandCQTDiscriminator(nn.Module):
             adv_loss = adv_loss + _adv
 
         return dis_loss, adv_loss, feature_matching_distance
+
+class CombinedDiscriminator(nn.Module):
+    def __init__(self, discriminator_configs: List[dict]):
+        super().__init__()
+        self.discriminators = nn.ModuleList([])
+        for cfg in discriminator_configs:
+            if cfg["type"] == "mscqt":
+                self.discriminators.append(MultiScaleSubbandCQTDiscriminator(**cfg["config"]))
+            elif cfg["type"] == "mpd":
+                self.discriminators.append(MultiPeriodDiscriminator(**cfg["config"]))
+            else:
+                raise NotImplementedError(f"Discriminator type {cfg['type']} not implemented!")
+    
+    def forward(self, y: torch.Tensor, y_hat: torch.Tensor) -> Tuple[
+        List[torch.Tensor],
+        List[torch.Tensor],
+        List[List[torch.Tensor]],
+        List[List[torch.Tensor]],
+    ]:
+        y_d_rs = []
+        y_d_gs = []
+        fmap_rs = []
+        fmap_gs = []
+        
+        for d in self.discriminators:
+            y_d_r, y_d_g, fmap_r, fmap_g = d(y, y_hat)
+            y_d_rs.append(y_d_r)
+            y_d_gs.append(y_d_g)
+            fmap_rs.append(fmap_r)
+            fmap_gs.append(fmap_g)
+        
+        return y_d_rs, y_d_gs, fmap_rs, fmap_gs
+
+    def loss(self, x, y):
+        dis_losses = []
+        adv_losses = []
+        feature_matching_distances = []
+        
+        for d in self.discriminators:
+            dis_loss, adv_loss, feature_matching_distance = d.loss(x, y)
+            dis_losses.append(dis_loss)
+            adv_losses.append(adv_loss)
+            feature_matching_distances.append(feature_matching_distance)
+
+        return sum(dis_losses), sum(adv_losses), sum(feature_matching_distances)
