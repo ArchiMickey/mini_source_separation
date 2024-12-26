@@ -51,3 +51,9 @@ save_dir: ckpts
 
 # gradient_clip_val passed into PyTorch Lightning Trainer
 gradient_clip_val: 0.0
+
+# limit_train_batches passed into PyTorch Lightning Trainer
+limit_train_batches: null
+
+# wandb resume id
+wandb_resume_id: null
