@@ -1,0 +1,390 @@
+import torch
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchaudio
+from einops import rearrange
+import numpy as np
+import librosa
+from rotary_embedding_torch import RotaryEmbedding, apply_rotary_emb
+
+from models.fourier import Fourier
+
+
+class BSRoformerUNet(Fourier):
+    def __init__(
+        self,
+        n_fft: int = 2048,
+        hop_length: int = 441,
+        input_channels: int = 2,
+        dim: int = 64,
+        dim_mults: int = [1, 2, 4, 8],
+        depths: list = [1, 2, 4, 4],
+        dim_head: int = 64,
+    ):
+        super().__init__(n_fft, hop_length)
+
+        self.input_channels = input_channels
+        self.dim = dim
+        self.dim_head = dim_head
+
+        self.cmplx_num = 2
+
+        self.patch_size = (4, 1)
+        sr = 44100
+        mel_bins = 256
+        out_channels = 64
+
+        self.stft_to_image = StftToImage(
+            in_channels=self.input_channels * self.cmplx_num, 
+            sr=sr, 
+            n_fft=n_fft, 
+            mel_bins=mel_bins,
+            out_channels=out_channels
+        )
+
+        self.fc_in = nn.Linear(
+            in_features=out_channels * np.prod(self.patch_size), 
+            out_features=self.dim
+        )
+
+        rotary_emb_t = RotaryEmbedding(dim=self.dim_head)
+        rotary_emb_f = RotaryEmbedding(dim=self.dim_head)
+        
+        self.depth = len(dim_mults)
+        dims = [dim * mult for mult in dim_mults]
+        dim_in_out = list(zip(dims[:-1], dims[1:]))
+        
+        self.downs = nn.ModuleList([])
+        for i, (dim_in, dim_out) in enumerate(dim_in_out):
+            is_last = i == self.depth - 1
+    
+            self.downs.append(nn.ModuleList([
+                nn.Sequential(*[TransformerBlock(dim=dim_in, n_heads=dim_in // dim_head, rotary_emb=rotary_emb_t) for _ in range(depths[i])]),
+                nn.Sequential(*[TransformerBlock(dim=dim_in, n_heads=dim_in // dim_head, rotary_emb=rotary_emb_f) for _ in range(depths[i])]),
+                nn.Conv2d(dim_in, dim_out, kernel_size=(1, 2), stride=(1, 2)) if not is_last else nn.Identity()
+            ]))
+        
+        self.mid_transformer_t = nn.Sequential(*[TransformerBlock(dim=dims[-1], n_heads=dims[-1] // dim_head, rotary_emb=rotary_emb_t) for _ in range(2)])
+        self.mid_transformer_f = nn.Sequential(*[TransformerBlock(dim=dims[-1], n_heads=dims[-1] // dim_head, rotary_emb=rotary_emb_f) for _ in range(2)])
+        
+        self.ups = nn.ModuleList([])
+        for i, (dim_in, dim_out) in enumerate(reversed(dim_in_out)):
+            is_last = i == self.depth - 1
+            
+            self.ups.append(nn.ModuleList([
+                nn.ConvTranspose2d(dim_out, dim_in, kernel_size=(1, 2), stride=(1, 2)) if not is_last else nn.Identity(),
+                FusionBlock(dim_in),
+                nn.Sequential(*[TransformerBlock(dim=dim_in, n_heads=dim_in // dim_head, rotary_emb=rotary_emb_t) for _ in range(depths[i])]),
+                FusionBlock(dim_in),
+                nn.Sequential(*[TransformerBlock(dim=dim_in, n_heads=dim_in // dim_head, rotary_emb=rotary_emb_f) for _ in range(depths[i])]),
+            ]))
+        
+        self.fc_out = nn.Linear(
+            in_features=self.dim, 
+            out_features=out_channels * np.prod(self.patch_size),
+        )
+        
+    def forward(self, mixture):
+        """Separation model.
+
+        Args:
+            mixture: (batch_size, channels_num, samples_num)
+
+        Outputs:
+            output: (batch_size, channels_num, samples_num)
+
+        Constants:
+            b: batch_size
+            c: channels_num=2
+            z: complex_num=2
+        """
+        
+        # Complex spectrum.
+        complex_sp = self.stft(mixture)
+        # shape: (b, c, t, f)
+
+        batch_size = complex_sp.shape[0]
+        time_steps = complex_sp.shape[2]
+
+        x = torch.view_as_real(complex_sp)
+        # shape: (b, c, t, f, z)
+
+        x = rearrange(x, 'b c t f z -> b (c z) t f')
+
+        x = self.stft_to_image.transform(x)
+        # shape: (b, d, t, f)
+
+        x = self.patchify(x)
+        # shape: (b, d, t, f)
+
+        hs_t = []
+        hs_f = []
+        for transformer_t, transformer_f, down in self.downs:
+            x = rearrange(x, 'b d t f -> (b f) t d')
+            x = transformer_t(x)
+            hs_t.append(x)
+            
+            x = rearrange(x, '(b f) t d -> (b t) f d', b=batch_size)
+            x = transformer_f(x)
+            hs_f.append(x)
+            
+            x = rearrange(x, '(b t) f d -> b d t f', b=batch_size)
+            x = down(x)
+        
+        x = rearrange(x, 'b d t f -> (b f) t d')
+        x = self.mid_transformer_t(x)
+        
+        x = rearrange(x, '(b f) t d -> (b t) f d', b=batch_size)
+        x = self.mid_transformer_f(x)
+        
+        x = rearrange(x, '(b t) f d -> b d t f', b=batch_size)
+        
+        for up, fusion_t, transformer_t, fusion_f, transformer_f in self.ups:
+            x = up(x)
+            
+            x = rearrange(x, 'b d t f -> (b f) t d')
+            x = fusion_t(x, hs_t.pop())
+            x = transformer_t(x)
+            
+            x = rearrange(x, '(b f) t d -> (b t) f d', b=batch_size)
+            x = fusion_f(x, hs_f.pop())
+            x = transformer_f(x)
+            
+            x = rearrange(x, '(b t) f d -> b d t f', b=batch_size)
+
+        x = self.unpatchify(x, time_steps)
+
+        x = self.stft_to_image.inverse_transform(x)
+
+        x = rearrange(x, 'b (c z) t f -> b c t f z', c=self.input_channels)
+        # shape: (b, c, t, f, z)
+
+        mask = torch.view_as_complex(x.contiguous())
+        # shape: (b, c, t, f)
+
+        sep_stft = mask * complex_sp
+
+        output = self.istft(sep_stft)
+        # (b, c, samples_num)
+
+        return output
+
+    def patchify(self, x):
+
+        B, C, T, Freq = x.shape
+        patch_size_t = self.patch_size[0]
+        pad_len = int(np.ceil(T / patch_size_t)) * patch_size_t - T
+        x = F.pad(x, pad=(0, 0, 0, pad_len))
+
+        t2, f2 = self.patch_size
+        x = rearrange(x, 'b d (t1 t2) (f1 f2) -> b t1 f1 (t2 f2 d)', t2=t2, f2=f2)
+        x = self.fc_in(x)  # (b, t, f, d)
+        x = rearrange(x, 'b t f d -> b d t f')
+
+        return x
+
+    def unpatchify(self, x, time_steps):
+        t2, f2 = self.patch_size
+        x = rearrange(x, 'b d t f -> b t f d')
+        x = self.fc_out(x)  # (b, t, f, d)
+        x = rearrange(x, 'b t1 f1 (t2 f2 d) -> b d (t1 t2) (f1 f2)', t2=t2, f2=f2)
+
+        x = x[:, :, 0 : time_steps, :]
+
+        return x
+
+class FusionBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.scale = nn.Parameter(torch.tensor(0.5))
+        self.conv = nn.Sequential(nn.Conv1d(channels, channels*2, kernel_size=3, padding=1), nn.GLU(dim=1))
+    
+    def forward(self, x, res):
+        num = x * (1. - self.scale) + res * self.scale
+        den = torch.sqrt((1 - self.scale) ** 2 + self.scale ** 2)
+        x = num / den
+        x = self.conv(x.transpose(1, 2))
+        return x.transpose(1, 2)
+        
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        r"""https://github.com/meta-llama/llama/blob/main/llama/model.py"""
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        norm_x = torch.mean(x ** 2, dim=-1, keepdim=True)
+        output = x * torch.rsqrt(norm_x + self.eps) * self.weight
+        return output
+
+
+class StftToImage(nn.Module):
+
+    def __init__(self, in_channels: int, sr: float, n_fft: int, mel_bins: int, out_channels: int):
+        super().__init__()
+
+        self.in_channels = in_channels
+        self.n_fft = n_fft
+        self.mel_bins = mel_bins
+
+        melbanks = librosa.filters.mel(
+            sr=sr, 
+            n_fft=n_fft, 
+            n_mels=self.mel_bins - 2, 
+            norm=None
+        )
+
+        melbank_first = np.zeros(melbanks.shape[-1])
+        melbank_first[0] = 1.
+
+        melbank_last = np.zeros(melbanks.shape[-1])
+        idx = np.argmax(melbanks[-1])
+        melbank_last[idx :] = 1. - melbanks[-1, idx :]
+
+        melbanks = np.concatenate(
+            [melbank_first[None, :], melbanks, melbank_last[None, :]], axis=0
+        )
+
+        sum_banks = np.sum(melbanks, axis=0)
+        assert np.allclose(a=sum_banks, b=1.)
+
+        self.band_nets = nn.ModuleList([])
+        self.inv_band_nets = nn.ModuleList([])
+        self.indexes = []
+        # 
+        for f in range(self.mel_bins):
+            
+            idxes = (melbanks[f] != 0).nonzero()[0]
+            self.indexes.append(idxes)
+            
+            in_dim = len(idxes) * in_channels
+            self.band_nets.append(nn.Linear(in_dim, out_channels))
+            self.inv_band_nets.append(nn.Linear(out_channels, in_dim))
+
+        # 
+        self.register_buffer(name='melbanks', tensor=torch.Tensor(melbanks))
+
+    def transform(self, x):
+
+        vs = []
+
+        for f in range(self.mel_bins):
+            
+            idxes = self.indexes[f]
+
+            bank = self.melbanks[f, idxes]  # (banks,)
+            stft_bank = x[..., idxes]  # (b, c, t, banks)
+
+            v = stft_bank * bank  # (b, c, t, banks)
+            v = rearrange(v, 'b c t q -> b t (c q)')
+
+            v = self.band_nets[f](v)  # (b, t, d)
+            vs.append(v)
+
+        x = torch.stack(vs, dim=2)  # (b, t, f, d)
+        x = rearrange(x, 'b t f d -> b d t f')
+
+        return x
+
+    def inverse_transform(self, x):
+
+        B, _, T, _ = x.shape
+        y = torch.zeros(B, self.in_channels, T, self.n_fft // 2 + 1).to(x.device)
+
+        for f in range(self.mel_bins):
+
+            idxes = self.indexes[f]
+            v = x[..., f]  # (b, d, t)
+            v = rearrange(v, 'b d t -> b t d')
+            v = self.inv_band_nets[f](v)  # (b, t, d)
+            v = rearrange(v, 'b t (c q) -> b c t q', q=len(idxes))
+            y[..., idxes] += v
+
+        return y
+
+
+class MLP(nn.Module):
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+
+        self.fc1 = nn.Linear(dim, 4 * dim, bias=False)
+        self.silu = nn.SiLU()
+        self.fc2 = nn.Linear(4 * dim, dim, bias=False)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.silu(x)
+        x = self.fc2(x)
+        return x
+
+
+class Attention(nn.Module):
+
+    def __init__(self, dim: int, n_heads: int, rotary_emb: RotaryEmbedding):
+        super().__init__()
+        
+        assert dim % n_heads == 0
+
+        self.n_heads = n_heads
+        self.dim = dim
+        self.rotary_emb = rotary_emb
+
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        assert self.flash, "Must have flash attention."
+        
+        self.c_attn = nn.Linear(dim, 3 * dim, bias=False)
+        self.c_proj = nn.Linear(dim, dim, bias=False)
+        
+    def forward(self, x):
+        r"""
+        Args:
+            x: (b, t, h*d)
+
+        Constants:
+            b: batch_size
+            t: time steps
+            r: 3
+            h: heads_num
+            d: heads_dim
+        """
+        B, T, C = x.size()
+
+        q, k, v = rearrange(self.c_attn(x), 'b t (r h d) -> r b h t d', r=3, h=self.n_heads)
+        # q, k, v: (b, h, t, d)
+
+        q = self.rotary_emb.rotate_queries_or_keys(q)
+        k = self.rotary_emb.rotate_queries_or_keys(k)
+
+        if self.flash:
+            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0, is_causal=False)
+        
+        y = rearrange(y, 'b h t d -> b t (h d)')
+
+        y = self.c_proj(y)
+        # shape: (b, t, h*d)
+
+        return y
+
+
+class TransformerBlock(nn.Module):
+    def __init__(self, dim: int, n_heads: int, rotary_emb: RotaryEmbedding):
+        
+        super().__init__()
+        self.dim = dim
+        self.n_heads = n_heads
+        
+        self.att_norm = RMSNorm(dim)
+        self.ffn_norm = RMSNorm(dim)
+        self.att = Attention(dim=dim, n_heads=n_heads, rotary_emb=rotary_emb)
+        self.mlp = MLP(dim=dim)
+        
+
+    def forward(
+        self,
+        x: torch.Tensor,
+    ):
+        x = x + self.att(self.att_norm(x))
+        x = x + self.mlp(self.ffn_norm(x))
+        return x

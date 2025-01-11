@@ -386,6 +386,20 @@ def get_model(model_name):
             # dim=384,
             # n_heads=12
         )
+    elif model_name == "BSRoformerUNet":
+        from models.bs_roformer_unet import BSRoformerUNet
+        return BSRoformerUNet(
+            dim=256,
+            dim_mults=[1, 2, 4, 4],
+            depths=[2, 2, 3, 3]
+        )
+    elif model_name == "BSRoformerUNet2":
+        from models.bs_roformer_unet2 import BSRoformerUNet
+        return BSRoformerUNet(
+            dim=256,
+            dim_mults=[1, 2, 4],
+            depths=[3, 3, 3]
+        )
     elif model_name == "WavUNet":
         from models.wavunet import WavUNet
         return WavUNet()
@@ -426,6 +440,20 @@ def l1_loss(output, target):
     return torch.mean(torch.abs(output - target))
 
 
+def calculate_sdrs(references, estimates, win=44100, hop=44100):
+    # compute SDR for one song
+    delta = 1e-7  # avoid numerical errors
+    sdrs = []
+    for i in range(0, references.shape[-1], win):
+        ref = references[..., i : i + win]
+        est = estimates[..., i : i + win]
+        num = np.sum(np.square(ref), axis=1)
+        den = np.sum(np.square(ref - est), axis=1)
+        num += delta
+        den += delta
+        sdr = 10 * np.log10(num / den)
+        sdrs.append(sdr)
+    return sdrs
 
 def validate(
     root: str, 
@@ -481,7 +509,8 @@ def validate(
         target_wav = data[target_source_type]
 
         # Calculate SDR. Shape should be (sources_num, channels_num, audio_samples)
-        (sdrs, _, _, _) = museval.evaluate([target_wav.T], [sep_wav.T])
+        # (sdrs, _, _, _) = museval.evaluate([target_wav.T], [sep_wav.T])
+        sdrs = calculate_sdrs(target_wav, sep_wav)
 
         sdr = np.nanmedian(sdrs)
         all_sdrs.append(sdr)
@@ -531,7 +560,7 @@ def separate(
 
         with torch.no_grad():
             model.eval()
-            batch_output = model(mixture=batch_clips)
+            batch_output = model(batch_clips)
             batch_output = batch_output.cpu().numpy()
 
         outputs.append(batch_output)

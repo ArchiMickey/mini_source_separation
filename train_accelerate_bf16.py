@@ -18,8 +18,6 @@ from copy import deepcopy
 
 import wandb
 
-wandb.require("core")
-
 from data.audio import load
 from data.musdb18hq import MUSDB18HQ
 from data.crops import RandomCrop
@@ -105,7 +103,6 @@ def train(args):
             project="mini_source_separation", 
             config=config, 
             name="{} {}".format(model_name, str(train_dataset.remix_weights)),
-            magic=True
         )
 
     model, ema, optimizer, train_dataloader, scheduler = accelerator.prepare(
@@ -115,17 +112,35 @@ def train(args):
     Path(checkpoints_dir).mkdir(parents=True, exist_ok=True)
 
     # Train
-    for step, data in enumerate(tqdm(train_dataloader)):
+    if accelerator.is_local_main_process:
+        total_params = sum(p.numel() for p in model.parameters())
+        if total_params >= 1e6:
+            print(f"Total parameters: {total_params / 1e6:.2f}M")
+        elif total_params >= 1e3:
+            print(f"Total parameters: {total_params / 1e3:.2f}K")
+        else:
+            print(f"Total parameters: {total_params}")
+    pbar = tqdm(train_dataloader)
+    for step, data in enumerate(pbar):
 
         mixture = data["mixture"]
         target = data["vocals"]
 
         # Forward
         model.train()
-        output = model(mixture=mixture) 
         
-        # Calculate loss
-        loss = l1_loss(output, target)
+        with accelerator.autocast():
+            output = model(mixture=mixture) 
+            
+            # Calculate loss
+            loss = l1_loss(output, target)
+        if accelerator.is_main_process:
+            pbar.set_postfix({"loss": loss.item(), "lr": scheduler.get_last_lr()[0]})
+        if wandb_log:
+            wandb.log({
+                "loss": loss.item(),
+                "lr": scheduler.get_last_lr()[0]
+            }, step=step)
 
         # Optimize
         optimizer.zero_grad()   # Reset all parameter.grad to 0
