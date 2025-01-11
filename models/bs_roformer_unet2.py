@@ -30,7 +30,7 @@ class BSRoformerUNet(Fourier):
 
         self.cmplx_num = 2
 
-        self.patch_size = (4, 1)
+        self.patch_size = (1, 1)
         sr = 44100
         mel_bins = 256
         out_channels = 64
@@ -65,7 +65,7 @@ class BSRoformerUNet(Fourier):
                     TransformerBlock(dim=dim_in, n_heads=dim_in // dim_head, rotary_emb=rotary_emb_t),
                     TransformerBlock(dim=dim_in, n_heads=dim_in // dim_head, rotary_emb=rotary_emb_f)
                 ]))
-            down.append(nn.Conv2d(dim_in, dim_out, kernel_size=(1, 2), stride=(1, 2)) if not is_last else nn.Conv2d(dim_in, dim_out, 1))
+            down.append(nn.Conv2d(dim_in, dim_out, kernel_size=(1, 4), stride=(1, 4)) if not is_last else nn.Conv2d(dim_in, dim_out, 1))
             
             self.downs.append(down)
         
@@ -88,7 +88,7 @@ class BSRoformerUNet(Fourier):
                     nn.Linear(dim_in + dim_out, dim_out),
                     TransformerBlock(dim=dim_out, n_heads=dim_out // dim_head, rotary_emb=rotary_emb_f)
                 ]))
-            up.append(nn.ConvTranspose2d(dim_out, dim_in, kernel_size=(1, 2), stride=(1, 2)) if not is_last else nn.Conv2d(dim_out, dim_in, 1))
+            up.append(nn.ConvTranspose2d(dim_out, dim_in, kernel_size=(1, 4), stride=(1, 4)) if not is_last else nn.Conv2d(dim_out, dim_in, 1))
             
             self.ups.append(up)
         
