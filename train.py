@@ -16,8 +16,6 @@ from copy import deepcopy
 
 import wandb
 
-wandb.require("core")
-
 from data.audio import load
 from data.musdb18hq import MUSDB18HQ
 from data.crops import RandomCrop
@@ -370,6 +368,77 @@ def get_model(model_name):
             dim=384,
             n_heads=12
         )
+    elif model_name == "BSRoformer15a_small":
+        from models.bs_roformer15 import BSRoformer15a
+        return BSRoformer15a(
+            input_channels=2,
+            depth=6,
+            dim=384,
+            n_heads=12
+        )
+    elif model_name == "BSRoformer15a_small_p22":
+        from models.bs_roformer15 import BSRoformer15a
+        return BSRoformer15a(
+            input_channels=2,
+            depth=6,
+            dim=384,
+            n_heads=12,
+            patch_size=(2, 2)
+        )
+    elif model_name == "BSRoformer15a_cnnunet_small":
+        from models.bs_roformer15_cnnunet import BSRoformer15a
+        return BSRoformer15a(
+            input_channels=2,
+            depth=6,
+            dim=384,
+            n_heads=12,
+            num_downs=2
+        )
+    elif model_name == "BSRoformer15a_cnnunet_small_down3":
+        from models.bs_roformer15_cnnunet import BSRoformer15a
+        return BSRoformer15a(
+            input_channels=2,
+            depth=6,
+            dim=384,
+            n_heads=12,
+            num_downs=3
+        )
+    elif model_name == "BSRoformer15a_cnnunet_smallx2_down3":
+        from models.bs_roformer15_cnnunet import BSRoformer15a
+        return BSRoformer15a(
+            input_channels=2,
+            depth=6,
+            dim=768,
+            n_heads=12,
+            num_downs=3
+        )
+    elif model_name == "BSRoformer15a_cnnunet_small_down4":
+        from models.bs_roformer15_cnnunet import BSRoformer15a
+        return BSRoformer15a(
+            input_channels=2,
+            depth=6,
+            dim=384,
+            n_heads=12,
+            num_downs=4
+        )
+    elif model_name == "BSRoformer15a_cnnunet_smallx4_down4":
+        from models.bs_roformer15_cnnunet import BSRoformer15a
+        return BSRoformer15a(
+            input_channels=2,
+            depth=6,
+            dim=1536,
+            n_heads=12,
+            num_downs=4
+        )
+    elif model_name == "BSRoformer15a_fullunet_small":
+        from models.bs_roformer15_fullunet import BSRoformer15a
+        return BSRoformer15a(
+            input_channels=2,
+            dim=96,
+            n_heads=12,
+            ch_mults=[1, 2, 4],
+            depth=[3, 3, 3]
+        )
     elif model_name == "BSRoformer16a":
         from models.bs_roformer16 import BSRoformer16a
         return BSRoformer16a(
@@ -386,6 +455,56 @@ def get_model(model_name):
             # dim=384,
             # n_heads=12
         )
+    elif model_name == "BSRoformer18a":
+        from models.bs_roformer18 import BSRoformer18
+        return BSRoformer18(
+            dim=96,
+            dim_mults=[1, 2, 4],
+            depths=[2, 2],
+            block_types=["resnet", "resnet"],
+            mid_transformer_depth=6,
+            attn_dim_head=32
+        )
+    elif model_name == "BSRoformer18b":
+        from models.bs_roformer18 import BSRoformer18
+        return BSRoformer18(
+            dim=96,
+            dim_mults=[1, 2, 4, 8],
+            depths=[2, 2, 3],
+            block_types=["resnet", "resnet", "bsroformer"],
+            mid_transformer_depth=6,
+            attn_dim_head=32
+        )
+    elif model_name == "BSRoformer18c":
+        from models.bs_roformer18 import BSRoformer18
+        return BSRoformer18(
+            dim=96,
+            dim_mults=[1, 2, 4],
+            depths=[2, 2],
+            block_types=["resnet", "resnet"],
+            mid_transformer_depth=12,
+            attn_dim_head=32
+        )
+    elif model_name == "BSRoformer18d":
+        from models.bs_roformer18 import BSRoformer18
+        return BSRoformer18(
+            dim=96,
+            dim_mults=[1, 2, 4],
+            depths=[2, 2],
+            block_types=["resnet", "resnet"],
+            mid_transformer_depth=3,
+            attn_dim_head=32
+        )
+    elif model_name == "BSRoformer19a":
+        from models.bs_roformer19 import BSRoformer19
+        return BSRoformer19(
+            dim=96,
+            dim_mults=[1, 2, 4],
+            depths=[2, 2],
+            block_types=["resnet", "resnet"],
+            mid_transformer_depth=12,
+            attn_dim_head=32
+        ) 
     elif model_name == "BSRoformerUNet":
         from models.bs_roformer_unet import BSRoformerUNet
         return BSRoformerUNet(
@@ -396,9 +515,9 @@ def get_model(model_name):
     elif model_name == "BSRoformerUNet2":
         from models.bs_roformer_unet2 import BSRoformerUNet
         return BSRoformerUNet(
-            dim=256,
+            dim=192,
             dim_mults=[1, 2, 4],
-            depths=[3, 3, 3]
+            depths=[2, 3, 4]
         )
     elif model_name == "WavUNet":
         from models.wavunet import WavUNet

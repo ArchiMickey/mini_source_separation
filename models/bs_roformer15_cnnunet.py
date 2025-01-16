@@ -18,8 +18,8 @@ class BSRoformer15a(Fourier):
         input_channels: int = 2,
         depth: int = 12,
         dim: int = 384,
-        n_heads: int = 12,
-        patch_size: tuple = (4, 1)
+        num_downs: int = 2,
+        n_heads: int = 12
     ):
         super().__init__(n_fft, hop_length)
 
@@ -31,8 +31,8 @@ class BSRoformer15a(Fourier):
         self.cmplx_num = 2
         
         self.head_dim = self.dim // self.n_heads
+        self.downsampling_ratio = 2**num_downs
 
-        self.patch_size = patch_size
         sr = 44100
         mel_bins = 256
         out_channels = 64
@@ -45,10 +45,28 @@ class BSRoformer15a(Fourier):
             out_channels=out_channels
         )
 
-        self.fc_in = nn.Linear(
-            in_features=out_channels * np.prod(self.patch_size), 
-            out_features=self.dim
-        )
+        init_dim = self.dim // 2**(num_downs)
+        self.init_conv = nn.Conv2d(out_channels, init_dim, kernel_size=7, padding=3)
+        
+        dims = [init_dim * 2**i for i in range(num_downs+1)]
+        in_out = list(zip(dims[:-1], dims[1:]))
+        
+        self.downs = nn.ModuleList([])
+        for i, (dim_in, dim_out) in enumerate(in_out):
+            is_last = i == len(in_out) - 1
+            self.downs.append(nn.ModuleList([
+                ResnetBlock(dim_in, dim_in),
+                ResnetBlock(dim_in, dim_in),
+                Downsample(dim_in, dim_out) if not is_last else nn.Conv2d(dim_in, dim_out, 1)
+            ]))
+        self.ups = nn.ModuleList([])
+        for i, (dim_in, dim_out) in enumerate(reversed(in_out)):
+            is_last = i == len(in_out) - 1
+            self.ups.append(nn.ModuleList([
+                ResnetBlock(dim_in + dim_out, dim_out),
+                ResnetBlock(dim_in + dim_out, dim_out),
+                Upsample(dim_out, dim_in) if not is_last else nn.Conv2d(dim_out, dim_in, 1)
+            ]))
 
         rotary_emb_t = RotaryEmbedding(dim=self.head_dim)
         rotary_emb_f = RotaryEmbedding(dim=self.head_dim)
@@ -61,10 +79,8 @@ class BSRoformer15a(Fourier):
                 TransformerBlock(dim=self.dim, n_heads=self.n_heads, rotary_emb=rotary_emb_f)
             ]))
 
-        self.fc_out = nn.Linear(
-            in_features=self.dim, 
-            out_features=out_channels * np.prod(self.patch_size),
-        )
+        self.final_resblock = ResnetBlock(init_dim * 2, init_dim)
+        self.final_conv = nn.Conv2d(init_dim, out_channels, kernel_size=1)
         
     def forward(self, mixture):
         """Separation model.
@@ -87,6 +103,7 @@ class BSRoformer15a(Fourier):
 
         batch_size = complex_sp.shape[0]
         time_steps = complex_sp.shape[2]
+                    
 
         x = torch.view_as_real(complex_sp)
         # shape: (b, c, t, f, z)
@@ -95,8 +112,19 @@ class BSRoformer15a(Fourier):
 
         x = self.stft_to_image.transform(x)
         # shape: (b, d, t, f)
+        
+        if time_steps % self.downsampling_ratio != 0:
+            x = F.pad(x, (0, 0, 0, self.downsampling_ratio - time_steps % self.downsampling_ratio))
 
-        x = self.patchify(x)
+        x = self.init_conv(x)
+        
+        skips = [x]
+        for block1, block2, down in self.downs:
+            x = block1(x)
+            skips.append(x)
+            x = block2(x)
+            skips.append(x)
+            x = down(x)
         # shape: (b, d, t, f)
 
         for t_transformer, f_transformer in self.transformers:
@@ -109,7 +137,17 @@ class BSRoformer15a(Fourier):
 
             x = rearrange(x, '(b t) f d -> b d t f', b=batch_size)
 
-        x = self.unpatchify(x, time_steps)
+        for block1, block2, up in self.ups:
+            x = torch.cat([x, skips.pop()], dim=1)
+            x = block1(x)
+            x = torch.cat([x, skips.pop()], dim=1)
+            x = block2(x)
+            x = up(x)
+        
+        x = self.final_resblock(torch.cat([x, skips.pop()], dim=1))
+        x = self.final_conv(x)
+        
+        x = x[:, :, :time_steps, :]
 
         x = self.stft_to_image.inverse_transform(x)
 
@@ -126,30 +164,43 @@ class BSRoformer15a(Fourier):
 
         return output
 
-    def patchify(self, x):
+class Downsample(nn.Module):
+    def __init__(self, dim_in, dim_out):
+        super().__init__()
+        self.conv = nn.Conv2d(dim_in, dim_out, kernel_size=2, stride=2, padding=(0, 0))
+        
+    def forward(self, x):
+        return self.conv(x)
 
-        B, C, T, Freq = x.shape
-        patch_size_t = self.patch_size[0]
-        pad_len = int(np.ceil(T / patch_size_t)) * patch_size_t - T
-        x = F.pad(x, pad=(0, 0, 0, pad_len))
+class Upsample(nn.Module):
+    def __init__(self, dim_in, dim_out):
+        super().__init__()
+        self.conv = nn.ConvTranspose2d(dim_in, dim_out, kernel_size=2, stride=2, padding=(0, 0))
+        
+    def forward(self, x):
+        return self.conv(x)
 
-        t2, f2 = self.patch_size
-        x = rearrange(x, 'b d (t1 t2) (f1 f2) -> b t1 f1 (t2 f2 d)', t2=t2, f2=f2)
-        x = self.fc_in(x)  # (b, t, f, d)
-        x = rearrange(x, 'b t f d -> b d t f')
-
-        return x
-
-    def unpatchify(self, x, time_steps):
-        t2, f2 = self.patch_size
-        x = rearrange(x, 'b d t f -> b t f d')
-        x = self.fc_out(x)  # (b, t, f, d)
-        x = rearrange(x, 'b t1 f1 (t2 f2 d) -> b d (t1 t2) (f1 f2)', t2=t2, f2=f2)
-
-        x = x[:, :, 0 : time_steps, :]
-
-        return x
-
+class ResnetBlock(nn.Module):
+    def __init__(self, dim, dim_out):
+        super().__init__()
+        self.block1 = nn.Sequential(
+            nn.Conv2d(dim, dim_out, kernel_size=3, stride=1, padding=1),
+            RMSNorm2d(dim_out),
+            nn.SiLU(),
+        )
+        
+        self.block2 = nn.Sequential(
+            nn.Conv2d(dim_out, dim_out, kernel_size=3, stride=1, padding=1),
+            RMSNorm2d(dim_out),
+            nn.SiLU(),
+        )
+        
+        self.res_conv = nn.Conv2d(dim, dim_out, kernel_size=1, stride=1, padding=0) if dim != dim_out else nn.Identity()
+    
+    def forward(self, x):
+        h = self.block1(x)
+        h = self.block2(h)
+        return h + self.res_conv(x)
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -163,6 +214,16 @@ class RMSNorm(nn.Module):
         output = x * torch.rsqrt(norm_x + self.eps) * self.weight
         return output
 
+
+class RMSNorm2d(RMSNorm):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__(dim, eps)
+        
+    def forward(self, x):
+        h, w = x.shape[-2:]
+        x = rearrange(x, 'b c h w -> b (h w) c')
+        x = super().forward(x)
+        return rearrange(x, 'b (h w) c -> b c h w', h=h, w=w)
 
 class StftToImage(nn.Module):
 

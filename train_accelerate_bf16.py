@@ -15,6 +15,7 @@ from torch import nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from copy import deepcopy
+from auraloss.freq import MultiResolutionSTFTLoss
 
 import wandb
 
@@ -77,7 +78,7 @@ def train(args):
     model = get_model(model_name)
 
     # EMA
-    ema = deepcopy(model)
+    ema = get_model(model_name)
     requires_grad(ema, False)
     update_ema(ema, model, decay=0)  # Ensure EMA is initialized with synced weights
     ema.eval()  # EMA model should always be in eval mode
@@ -120,6 +121,16 @@ def train(args):
             print(f"Total parameters: {total_params / 1e3:.2f}K")
         else:
             print(f"Total parameters: {total_params}")
+    
+    mrstft_loss = MultiResolutionSTFTLoss(
+        fft_sizes=[2048, 1024, 512, 256, 128, 64, 32],
+        hop_sizes=[512, 256, 128, 64, 32, 16, 8],
+        win_lengths=[2048, 1024, 512, 256, 128, 64, 32],
+        w_sc=0.0,
+        w_log_mag=0.0,
+        w_lin_mag=1.0,
+    )        
+    
     pbar = tqdm(train_dataloader)
     for step, data in enumerate(pbar):
 
@@ -134,6 +145,8 @@ def train(args):
             
             # Calculate loss
             loss = l1_loss(output, target)
+            # loss += mrstft_loss(output, target)
+            
         if accelerator.is_main_process:
             pbar.set_postfix({"loss": loss.item(), "lr": scheduler.get_last_lr()[0]})
         if wandb_log:
@@ -152,7 +165,7 @@ def train(args):
         update_ema(ema_model=ema, model=accelerator.unwrap_model(model))
 
         # Learning rate scheduler (optional)
-        if use_scheduler:
+        if use_scheduler and accelerator.is_main_process:
             scheduler.step()
         
         # Evaluate

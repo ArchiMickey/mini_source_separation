@@ -16,10 +16,10 @@ class BSRoformer15a(Fourier):
         n_fft: int = 2048,
         hop_length: int = 441,
         input_channels: int = 2,
-        depth: int = 12,
-        dim: int = 384,
-        n_heads: int = 12,
-        patch_size: tuple = (4, 1)
+        dim: int = 96,
+        ch_mults: list = [1, 2, 4],
+        depth: list = [3, 3, 3],
+        n_heads: int = 12
     ):
         super().__init__(n_fft, hop_length)
 
@@ -31,11 +31,15 @@ class BSRoformer15a(Fourier):
         self.cmplx_num = 2
         
         self.head_dim = self.dim // self.n_heads
+        num_downs = len(ch_mults) - 1
+        self.downsampling_ratio = 2**num_downs
+        
+        assert len(ch_mults) == len(depth)
 
-        self.patch_size = patch_size
         sr = 44100
         mel_bins = 256
         out_channels = 64
+        self.patch_size = (2, 2)
 
         self.stft_to_image = StftToImage(
             in_channels=self.input_channels * self.cmplx_num, 
@@ -45,27 +49,47 @@ class BSRoformer15a(Fourier):
             out_channels=out_channels
         )
 
-        self.fc_in = nn.Linear(
-            in_features=out_channels * np.prod(self.patch_size), 
-            out_features=self.dim
-        )
-
+        self.patch_embed = nn.Conv2d(out_channels, dim, kernel_size=self.patch_size, stride=self.patch_size)
+        
+        dims = [dim * mult for mult in ch_mults]
+        in_out = list(zip(dims[:-1], dims[1:]))
+        
         rotary_emb_t = RotaryEmbedding(dim=self.head_dim)
         rotary_emb_f = RotaryEmbedding(dim=self.head_dim)
         
-        self.transformers = nn.ModuleList([])
-
-        for _ in range(self.depth):
-            self.transformers.append(nn.ModuleList([
-                TransformerBlock(dim=self.dim, n_heads=self.n_heads, rotary_emb=rotary_emb_t),
-                TransformerBlock(dim=self.dim, n_heads=self.n_heads, rotary_emb=rotary_emb_f)
+        self.downs = nn.ModuleList([])
+        for i, (dim_in, dim_out) in enumerate(in_out):
+            is_last = i == len(in_out) - 1
+            self.downs.append(nn.ModuleList([
+                *[BSRoformerBlock(dim_in, n_heads, rotary_emb_t, rotary_emb_f) for _ in range(depth[i])],
+                Downsample(dim_in, dim_out) if not is_last else nn.Conv2d(dim_in, dim_out, 1)
             ]))
-
-        self.fc_out = nn.Linear(
-            in_features=self.dim, 
-            out_features=out_channels * np.prod(self.patch_size),
-        )
         
+        self.mids = nn.ModuleList([
+            BSRoformerBlock(dim_out, n_heads, rotary_emb_t, rotary_emb_f) for _ in range(2)
+        ])
+            
+        self.ups = nn.ModuleList([])
+        for i, (dim_in, dim_out) in enumerate(reversed(in_out)):
+            is_last = i == len(in_out) - 1
+            self.ups.append(nn.ModuleList([
+                *[nn.Sequential(nn.Conv2d(dim_in + dim_out, dim_out, 1), BSRoformerBlock(dim_out, n_heads, rotary_emb_t, rotary_emb_f)) for _ in range(depth[i])],
+                Upsample(dim_out, dim_in) if not is_last else nn.Conv2d(dim_out, dim_in, 1)
+            ]))
+        
+        self.decoder_pred = nn.Conv2d(dim_in, out_channels * np.prod(self.patch_size), kernel_size=1)
+
+    def patchify(self, x):
+        x = F.pad(x, (0, self.downsampling_ratio - x.size(-1) % self.downsampling_ratio, 0, self.downsampling_ratio - x.size(-2) % self.downsampling_ratio))
+        x = self.patch_embed(x)
+        return x
+    
+    def unpatchify(self, x):
+        t2, f2 = self.patch_size
+        x = self.decoder_pred(x)
+        x = rearrange(x, 'b (c p1 p2) t f -> b c (t p1) (f p2)', p1=t2, p2=f2)
+        return x
+    
     def forward(self, mixture):
         """Separation model.
 
@@ -87,6 +111,7 @@ class BSRoformer15a(Fourier):
 
         batch_size = complex_sp.shape[0]
         time_steps = complex_sp.shape[2]
+                    
 
         x = torch.view_as_real(complex_sp)
         # shape: (b, c, t, f, z)
@@ -95,21 +120,35 @@ class BSRoformer15a(Fourier):
 
         x = self.stft_to_image.transform(x)
         # shape: (b, d, t, f)
+        
+        time_steps_pad = self.patch_size[0] * self.downsampling_ratio
+        if x.shape[-2] % time_steps_pad != 0:
+            x = F.pad(x, (0, 0, 0, time_steps_pad - x.size(-2) % time_steps_pad))
 
         x = self.patchify(x)
+        
+        skips = [x]
+        for enc in self.downs:
+            blocks, down = enc[:-1], enc[-1]
+            for block in blocks:
+                x = block(x)
+                skips.append(x)
+            x = down(x)
         # shape: (b, d, t, f)
 
-        for t_transformer, f_transformer in self.transformers:
-
-            x = rearrange(x, 'b d t f -> (b f) t d')
-            x = t_transformer(x)
-
-            x = rearrange(x, '(b f) t d -> (b t) f d', b=batch_size)
-            x = f_transformer(x)
-
-            x = rearrange(x, '(b t) f d -> b d t f', b=batch_size)
-
-        x = self.unpatchify(x, time_steps)
+        for dec in self.mids:
+            x = dec(x)
+        
+        for dec in self.ups:
+            blocks, up = dec[:-1], dec[-1]
+            for block in blocks:
+                x = torch.cat([x, skips.pop()], dim=1)
+                x = block(x)
+            x = up(x)
+        
+        x = self.unpatchify(x)
+        
+        x = x[:, :, :time_steps, :]
 
         x = self.stft_to_image.inverse_transform(x)
 
@@ -126,30 +165,43 @@ class BSRoformer15a(Fourier):
 
         return output
 
-    def patchify(self, x):
+class Downsample(nn.Module):
+    def __init__(self, dim_in, dim_out):
+        super().__init__()
+        self.conv = nn.Conv2d(dim_in, dim_out, kernel_size=2, stride=2, padding=(0, 0))
+        
+    def forward(self, x):
+        return self.conv(x)
 
-        B, C, T, Freq = x.shape
-        patch_size_t = self.patch_size[0]
-        pad_len = int(np.ceil(T / patch_size_t)) * patch_size_t - T
-        x = F.pad(x, pad=(0, 0, 0, pad_len))
+class Upsample(nn.Module):
+    def __init__(self, dim_in, dim_out):
+        super().__init__()
+        self.conv = nn.ConvTranspose2d(dim_in, dim_out, kernel_size=2, stride=2, padding=(0, 0))
+        
+    def forward(self, x):
+        return self.conv(x)
 
-        t2, f2 = self.patch_size
-        x = rearrange(x, 'b d (t1 t2) (f1 f2) -> b t1 f1 (t2 f2 d)', t2=t2, f2=f2)
-        x = self.fc_in(x)  # (b, t, f, d)
-        x = rearrange(x, 'b t f d -> b d t f')
-
-        return x
-
-    def unpatchify(self, x, time_steps):
-        t2, f2 = self.patch_size
-        x = rearrange(x, 'b d t f -> b t f d')
-        x = self.fc_out(x)  # (b, t, f, d)
-        x = rearrange(x, 'b t1 f1 (t2 f2 d) -> b d (t1 t2) (f1 f2)', t2=t2, f2=f2)
-
-        x = x[:, :, 0 : time_steps, :]
-
-        return x
-
+class ResnetBlock(nn.Module):
+    def __init__(self, dim, dim_out):
+        super().__init__()
+        self.block1 = nn.Sequential(
+            nn.Conv2d(dim, dim_out, kernel_size=3, stride=1, padding=1),
+            RMSNorm2d(dim_out),
+            nn.SiLU(),
+        )
+        
+        self.block2 = nn.Sequential(
+            nn.Conv2d(dim_out, dim_out, kernel_size=3, stride=1, padding=1),
+            RMSNorm2d(dim_out),
+            nn.SiLU(),
+        )
+        
+        self.res_conv = nn.Conv2d(dim, dim_out, kernel_size=1, stride=1, padding=0) if dim != dim_out else nn.Identity()
+    
+    def forward(self, x):
+        h = self.block1(x)
+        h = self.block2(h)
+        return h + self.res_conv(x)
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -163,6 +215,16 @@ class RMSNorm(nn.Module):
         output = x * torch.rsqrt(norm_x + self.eps) * self.weight
         return output
 
+
+class RMSNorm2d(RMSNorm):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__(dim, eps)
+        
+    def forward(self, x):
+        h, w = x.shape[-2:]
+        x = rearrange(x, 'b c h w -> b (h w) c')
+        x = super().forward(x)
+        return rearrange(x, 'b (h w) c -> b c h w', h=h, w=w)
 
 class StftToImage(nn.Module):
 
@@ -331,4 +393,18 @@ class TransformerBlock(nn.Module):
     ):
         x = x + self.att(self.att_norm(x))
         x = x + self.mlp(self.ffn_norm(x))
+        return x
+
+class BSRoformerBlock(nn.Module):
+    def __init__(self, dim: int, n_heads: int, rotary_emb_t: RotaryEmbedding, rotary_emb_f: RotaryEmbedding):
+        super().__init__()
+        self.transformer_t = TransformerBlock(dim=dim, n_heads=n_heads, rotary_emb=rotary_emb_t)
+        self.transformer_f = TransformerBlock(dim=dim, n_heads=n_heads, rotary_emb=rotary_emb_f)
+    def forward(self, x):
+        b = x.size(0)
+        x = rearrange(x, 'b d t f -> (b f) t d')
+        x = self.transformer_t(x)
+        x = rearrange(x, '(b f) t d -> (b t) f d', b=b)
+        x = self.transformer_f(x)
+        x = rearrange(x, '(b t) f d -> b d t f', b=b)
         return x
