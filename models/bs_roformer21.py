@@ -10,7 +10,7 @@ from rotary_embedding_torch import RotaryEmbedding, apply_rotary_emb
 from models.fourier import Fourier
 
 
-class BSRoformer19(Fourier):
+class BSRoformer21(Fourier):
     def __init__(
         self,
         n_fft: int = 2048,
@@ -339,13 +339,14 @@ class MLP(nn.Module):
     def __init__(self, dim: int) -> None:
         super().__init__()
 
-        self.fc1 = nn.Linear(dim, 4 * dim, bias=False)
+        self.fc1 = nn.Linear(dim, 8 * dim, bias=False)
         self.silu = nn.SiLU()
         self.fc2 = nn.Linear(4 * dim, dim, bias=False)
 
     def forward(self, x):
         x = self.fc1(x)
-        x = self.silu(x)
+        x, gate = x.chunk(2, dim=-1)
+        x = self.silu(x) * gate
         x = self.fc2(x)
         return x
 
@@ -363,6 +364,9 @@ class Attention(nn.Module):
 
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         assert self.flash, "Must have flash attention."
+        
+        self.q_norm = RMSNorm(dim // n_heads)
+        self.k_norm = RMSNorm(dim // n_heads)
         
         self.c_attn = nn.Linear(dim, 3 * dim, bias=False)
         self.c_proj = nn.Linear(dim, dim, bias=False)
@@ -383,6 +387,9 @@ class Attention(nn.Module):
 
         q, k, v = rearrange(self.c_attn(x), 'b t (r h d) -> r b h t d', r=3, h=self.n_heads)
         # q, k, v: (b, h, t, d)
+        
+        q = self.q_norm(q)
+        k = self.k_norm(k)
 
         q = self.rotary_emb.rotate_queries_or_keys(q)
         k = self.rotary_emb.rotate_queries_or_keys(k)
@@ -397,7 +404,10 @@ class Attention(nn.Module):
 
         return y
 
-class Attention2d(nn.Module):
+def l2norm(t):
+    return F.normalize(t, dim = -1, p = 2)
+
+class LinearAttention2d(nn.Module):
     def __init__(self, dim: int, n_heads: int):
         super().__init__()
         self.dim = dim
@@ -406,24 +416,27 @@ class Attention2d(nn.Module):
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         assert self.flash, "Must have flash attention."
         
-        self.qkv = nn.Conv2d(dim, dim * 3, 1, bias=False)
-        self.c_proj = nn.Conv2d(dim, dim, 1, bias=False)
+        self.temperature = nn.Parameter(torch.zeros(n_heads, 1, 1))
+        
+        self.qkv = nn.Linear(dim, dim * 3, bias=False)
+        self.c_proj = nn.Linear(dim, dim, bias=False)
     
     def forward(self, x):
-        H, W = x.shape[-2:]
-        q, k, v = self.qkv(x).chunk(3, dim=1)
-        q, k, v = map(lambda t: rearrange(t, 'b (h c) x y -> b h (x y) c', h=self.n_heads), (q, k, v))
+        q, k, v = self.qkv(x).chunk(3, dim=-1)
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h d n', h=self.n_heads), (q, k, v))
+        
+        q, k = map(l2norm, (q, k))
+        q = q * self.temperature.exp()
         
         if self.flash:
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0, is_causal=False)
+            out = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0, is_causal=False)
         
-        y = rearrange(y, 'b h (x y) c -> b (h c) x y', x=H, y=W)
-        y = self.c_proj(y)
+        out = rearrange(out, 'b h d n -> b n (h d)')
         
-        return y
+        return self.c_proj(out)
 
 class TransformerBlock(nn.Module):
-    def __init__(self, dim: int, n_heads: int, rotary_emb: RotaryEmbedding):
+    def __init__(self, dim: int, n_heads: int, rotary_emb: RotaryEmbedding=None, linear_attn=False):
         
         super().__init__()
         self.dim = dim
@@ -431,7 +444,7 @@ class TransformerBlock(nn.Module):
         
         self.att_norm = RMSNorm(dim)
         self.ffn_norm = RMSNorm(dim)
-        self.att = LayerScale(dim, Attention(dim=dim, n_heads=n_heads, rotary_emb=rotary_emb))
+        self.att = LayerScale(dim, Attention(dim=dim, n_heads=n_heads, rotary_emb=rotary_emb) if not linear_attn else LinearAttention2d(dim=dim, n_heads=n_heads))
         self.mlp = LayerScale(dim, MLP(dim=dim))
         
 
@@ -446,11 +459,14 @@ class TransformerBlock(nn.Module):
 class BSRoformerBlock(nn.Module):
     def __init__(self, dim: int, n_heads: int, rotary_emb_t: RotaryEmbedding, rotary_emb_f: RotaryEmbedding):
         super().__init__()
+        self.transformer = TransformerBlock(dim=dim, n_heads=n_heads, linear_attn=True)
         self.transformer_t = TransformerBlock(dim=dim, n_heads=n_heads, rotary_emb=rotary_emb_t)
         self.transformer_f = TransformerBlock(dim=dim, n_heads=n_heads, rotary_emb=rotary_emb_f)
     def forward(self, x):
-        b = x.size(0)
-        x = rearrange(x, 'b d t f -> (b f) t d')
+        b, t = x.size(0), x.size(2)
+        x = rearrange(x, 'b d t f -> b (t f) d')
+        x = self.transformer(x)
+        x = rearrange(x, 'b (t f) d -> (b f) t d', t=t)
         x = self.transformer_t(x)
         x = rearrange(x, '(b f) t d -> (b t) f d', b=b)
         x = self.transformer_f(x)

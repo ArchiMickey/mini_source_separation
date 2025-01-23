@@ -10,32 +10,29 @@ from rotary_embedding_torch import RotaryEmbedding, apply_rotary_emb
 from models.fourier import Fourier
 
 
-class BSRoformer19(Fourier):
+class BSRoformer15a(Fourier):
     def __init__(
         self,
         n_fft: int = 2048,
         hop_length: int = 441,
         input_channels: int = 2,
-        dim: int = 96,
-        dim_mults: list = [1, 2, 4],
-        depths: list = [2, 2, 2],
-        block_types: list = ['resnet', 'resnet', 'resnet'],
-        mid_transformer_depth: int = 6,
-        attn_dim_head: int = 32,
+        depth: int = 12,
+        dim: int = 384,
+        n_heads: int = 12,
+        patch_size: tuple = (4, 1)
     ):
         super().__init__(n_fft, hop_length)
 
-        assert len(block_types) == len(depths) == len(dim_mults) - 1
-        
         self.input_channels = input_channels
+        self.depth = depth
         self.dim = dim
+        self.n_heads = n_heads
 
         self.cmplx_num = 2
         
-        self.head_dim = attn_dim_head
-        num_downs = len(dim_mults) - 1
-        self.downsampling_ratio = 2**num_downs
+        self.head_dim = self.dim // self.n_heads
 
+        self.patch_size = patch_size
         sr = 44100
         mel_bins = 256
         out_channels = 64
@@ -48,63 +45,26 @@ class BSRoformer19(Fourier):
             out_channels=out_channels
         )
 
-        init_dim = dim
-        self.init_conv = nn.Conv2d(out_channels, dim, kernel_size=7, padding=3)
-        
-        dims = [dim * m for m in dim_mults]
-        in_out = list(zip(dims[:-1], dims[1:]))
-        
+        self.fc_in = nn.Linear(
+            in_features=out_channels * np.prod(self.patch_size), 
+            out_features=self.dim
+        )
+
         rotary_emb_t = RotaryEmbedding(dim=self.head_dim)
         rotary_emb_f = RotaryEmbedding(dim=self.head_dim)
         
-        self.downs = nn.ModuleList([])
-        for i, ((dim_in, dim_out), block_type, depth) in enumerate(zip(in_out, block_types, depths)):
-            is_last = i == len(in_out) - 1
-            blocks = nn.ModuleList([])
-            for _ in range(depth):
-                if block_type == 'resnet':
-                    blocks.append(ResnetBlock(dim_in, dim_in))
-                elif block_type == 'bsroformer':
-                    blocks.append(BSRoformerBlock(dim_in, dim_in // attn_dim_head, rotary_emb_t, rotary_emb_f))
-                elif block_type == 'resnet+bsroformer':
-                    blocks.append(nn.Sequential(
-                        ResnetBlock(dim_in, dim_in),
-                        BSRoformerBlock(dim_in, dim_in // attn_dim_head, rotary_emb_t, rotary_emb_f)
-                    ))
-                else:
-                    raise NotImplementedError(f"Block type {block_type} is not implemented.")
-            blocks.append(Downsample(dim_in, dim_out) if not is_last else nn.Conv2d(dim_in, dim_out, 1))
-            self.downs.append(blocks)
-        
         self.transformers = nn.ModuleList([])
 
-        for _ in range(mid_transformer_depth):
-            self.transformers.append(BSRoformerBlock(dim_out, dim_out // attn_dim_head, rotary_emb_t, rotary_emb_f))
-        
-        self.ups = nn.ModuleList([])
-        for i, ((dim_in, dim_out), block_type, depth) in enumerate(zip(reversed(in_out), reversed(block_types), reversed(depths))):
-            is_last = i == len(in_out) - 1
-            blocks = nn.ModuleList([])
-            for _ in range(depth):
-                if block_type == 'resnet':
-                    blocks.append(ResnetBlock(dim_in + dim_out, dim_out))
-                elif block_type == 'bsroformer':
-                    blocks.append(nn.Sequential(
-                        nn.Conv2d(dim_in + dim_out, dim_out, 1),
-                        BSRoformerBlock(dim_out, dim_out // attn_dim_head, rotary_emb_t, rotary_emb_f)
-                    ))
-                elif block_type == 'resnet+bsroformer':
-                    blocks.append(nn.Sequential(
-                        ResnetBlock(dim_in + dim_out, dim_out),
-                        BSRoformerBlock(dim_out, dim_out // attn_dim_head, rotary_emb_t, rotary_emb_f)
-                    ))
-                else:
-                    raise NotImplementedError(f"Block type {block_type} is not implemented.")
-            blocks.append(Upsample(dim_out, dim_in) if not is_last else nn.Conv2d(dim_out, dim_in, 1))
-            self.ups.append(blocks)
+        for _ in range(self.depth):
+            self.transformers.append(nn.ModuleList([
+                TransformerBlock(dim=self.dim, n_heads=self.n_heads, rotary_emb=rotary_emb_t),
+                TransformerBlock(dim=self.dim, n_heads=self.n_heads, rotary_emb=rotary_emb_f)
+            ]))
 
-        self.final_resblock = ResnetBlock(init_dim * 2, init_dim)
-        self.final_conv = nn.Conv2d(init_dim, out_channels, kernel_size=1)
+        self.fc_out = nn.Linear(
+            in_features=self.dim, 
+            out_features=out_channels * np.prod(self.patch_size),
+        )
         
     def forward(self, mixture):
         """Separation model.
@@ -127,7 +87,6 @@ class BSRoformer19(Fourier):
 
         batch_size = complex_sp.shape[0]
         time_steps = complex_sp.shape[2]
-                    
 
         x = torch.view_as_real(complex_sp)
         # shape: (b, c, t, f, z)
@@ -136,35 +95,21 @@ class BSRoformer19(Fourier):
 
         x = self.stft_to_image.transform(x)
         # shape: (b, d, t, f)
-        
-        if time_steps % self.downsampling_ratio != 0:
-            x = F.pad(x, (0, 0, 0, self.downsampling_ratio - time_steps % self.downsampling_ratio))
 
-        x = self.init_conv(x)
-        
-        skips = [x]
-        for stage in self.downs:
-            blocks, down = stage[:-1], stage[-1]
-            for block in blocks:
-                x = block(x)
-                skips.append(x)
-            x = down(x)
+        x = self.patchify(x)
         # shape: (b, d, t, f)
 
-        for transformer in self.transformers:
-            x = transformer(x)
+        for t_transformer, f_transformer in self.transformers:
 
-        for stage in self.ups:
-            blocks, up = stage[:-1], stage[-1]
-            for block in blocks:
-                x = torch.cat([x, skips.pop()], dim=1)
-                x = block(x)
-            x = up(x)
-        
-        x = self.final_resblock(torch.cat([x, skips.pop()], dim=1))
-        x = self.final_conv(x)
-        
-        x = x[:, :, :time_steps, :]
+            x = rearrange(x, 'b d t f -> (b f) t d')
+            x = t_transformer(x)
+
+            x = rearrange(x, '(b f) t d -> (b t) f d', b=batch_size)
+            x = f_transformer(x)
+
+            x = rearrange(x, '(b t) f d -> b d t f', b=batch_size)
+
+        x = self.unpatchify(x, time_steps)
 
         x = self.stft_to_image.inverse_transform(x)
 
@@ -181,43 +126,30 @@ class BSRoformer19(Fourier):
 
         return output
 
-class Downsample(nn.Module):
-    def __init__(self, dim_in, dim_out):
-        super().__init__()
-        self.conv = nn.Conv2d(dim_in, dim_out, kernel_size=2, stride=2, padding=(0, 0))
-        
-    def forward(self, x):
-        return self.conv(x)
+    def patchify(self, x):
 
-class Upsample(nn.Module):
-    def __init__(self, dim_in, dim_out):
-        super().__init__()
-        self.conv = nn.ConvTranspose2d(dim_in, dim_out, kernel_size=2, stride=2, padding=(0, 0))
-        
-    def forward(self, x):
-        return self.conv(x)
+        B, C, T, Freq = x.shape
+        patch_size_t = self.patch_size[0]
+        pad_len = int(np.ceil(T / patch_size_t)) * patch_size_t - T
+        x = F.pad(x, pad=(0, 0, 0, pad_len))
 
-class ResnetBlock(nn.Module):
-    def __init__(self, dim, dim_out):
-        super().__init__()
-        self.block1 = nn.Sequential(
-            nn.Conv2d(dim, dim_out, kernel_size=3, stride=1, padding=1),
-            RMSNorm2d(dim_out),
-            nn.SiLU(),
-        )
-        
-        self.block2 = nn.Sequential(
-            nn.Conv2d(dim_out, dim_out, kernel_size=3, stride=1, padding=1),
-            RMSNorm2d(dim_out),
-            nn.SiLU(),
-        )
-        
-        self.res_conv = nn.Conv2d(dim, dim_out, kernel_size=1, stride=1, padding=0) if dim != dim_out else nn.Identity()
-    
-    def forward(self, x):
-        h = self.block1(x)
-        h = self.block2(h)
-        return h + self.res_conv(x)
+        t2, f2 = self.patch_size
+        x = rearrange(x, 'b d (t1 t2) (f1 f2) -> b t1 f1 (t2 f2 d)', t2=t2, f2=f2)
+        x = self.fc_in(x)  # (b, t, f, d)
+        x = rearrange(x, 'b t f d -> b d t f')
+
+        return x
+
+    def unpatchify(self, x, time_steps):
+        t2, f2 = self.patch_size
+        x = rearrange(x, 'b d t f -> b t f d')
+        x = self.fc_out(x)  # (b, t, f, d)
+        x = rearrange(x, 'b t1 f1 (t2 f2 d) -> b d (t1 t2) (f1 f2)', t2=t2, f2=f2)
+
+        x = x[:, :, 0 : time_steps, :]
+
+        return x
+
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -231,16 +163,6 @@ class RMSNorm(nn.Module):
         output = x * torch.rsqrt(norm_x + self.eps) * self.weight
         return output
 
-
-class RMSNorm2d(RMSNorm):
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__(dim, eps)
-        
-    def forward(self, x):
-        h, w = x.shape[-2:]
-        x = rearrange(x, 'b c h w -> b (h w) c')
-        x = super().forward(x)
-        return rearrange(x, 'b (h w) c -> b c h w', h=h, w=w)
 
 class StftToImage(nn.Module):
 
@@ -397,30 +319,6 @@ class Attention(nn.Module):
 
         return y
 
-class Attention2d(nn.Module):
-    def __init__(self, dim: int, n_heads: int):
-        super().__init__()
-        self.dim = dim
-        self.n_heads = n_heads
-        
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
-        assert self.flash, "Must have flash attention."
-        
-        self.qkv = nn.Conv2d(dim, dim * 3, 1, bias=False)
-        self.c_proj = nn.Conv2d(dim, dim, 1, bias=False)
-    
-    def forward(self, x):
-        H, W = x.shape[-2:]
-        q, k, v = self.qkv(x).chunk(3, dim=1)
-        q, k, v = map(lambda t: rearrange(t, 'b (h c) x y -> b h (x y) c', h=self.n_heads), (q, k, v))
-        
-        if self.flash:
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0, is_causal=False)
-        
-        y = rearrange(y, 'b h (x y) c -> b (h c) x y', x=H, y=W)
-        y = self.c_proj(y)
-        
-        return y
 
 class TransformerBlock(nn.Module):
     def __init__(self, dim: int, n_heads: int, rotary_emb: RotaryEmbedding):
@@ -441,18 +339,4 @@ class TransformerBlock(nn.Module):
     ):
         x = x + self.att(self.att_norm(x))
         x = x + self.mlp(self.ffn_norm(x))
-        return x
-
-class BSRoformerBlock(nn.Module):
-    def __init__(self, dim: int, n_heads: int, rotary_emb_t: RotaryEmbedding, rotary_emb_f: RotaryEmbedding):
-        super().__init__()
-        self.transformer_t = TransformerBlock(dim=dim, n_heads=n_heads, rotary_emb=rotary_emb_t)
-        self.transformer_f = TransformerBlock(dim=dim, n_heads=n_heads, rotary_emb=rotary_emb_f)
-    def forward(self, x):
-        b = x.size(0)
-        x = rearrange(x, 'b d t f -> (b f) t d')
-        x = self.transformer_t(x)
-        x = rearrange(x, '(b f) t d -> (b t) f d', b=b)
-        x = self.transformer_f(x)
-        x = rearrange(x, '(b t) f d -> b d t f', b=b)
         return x

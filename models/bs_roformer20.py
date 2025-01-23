@@ -10,7 +10,7 @@ from rotary_embedding_torch import RotaryEmbedding, apply_rotary_emb
 from models.fourier import Fourier
 
 
-class BSRoformer19(Fourier):
+class BSRoformer20(Fourier):
     def __init__(
         self,
         n_fft: int = 2048,
@@ -184,18 +184,32 @@ class BSRoformer19(Fourier):
 class Downsample(nn.Module):
     def __init__(self, dim_in, dim_out):
         super().__init__()
-        self.conv = nn.Conv2d(dim_in, dim_out, kernel_size=2, stride=2, padding=(0, 0))
+        self.conv_t = nn.Conv1d(dim_in, dim_out, kernel_size=4, stride=2, padding=1)
+        self.conv_f = nn.Conv1d(dim_out, dim_out, kernel_size=4, stride=2, padding=1)
         
     def forward(self, x):
-        return self.conv(x)
+        b = x.shape[0]
+        x = rearrange(x, 'b d t f -> (b f) d t')
+        x = self.conv_t(x)
+        x = rearrange(x, '(b f) d t -> (b t) d f', b=b)
+        x = self.conv_f(x)
+        x = rearrange(x, '(b t) d f -> b d t f', b=b)
+        return x
 
 class Upsample(nn.Module):
     def __init__(self, dim_in, dim_out):
         super().__init__()
-        self.conv = nn.ConvTranspose2d(dim_in, dim_out, kernel_size=2, stride=2, padding=(0, 0))
+        self.conv_t = nn.ConvTranspose1d(dim_in, dim_out, kernel_size=4, stride=2, padding=1)
+        self.conv_f = nn.ConvTranspose1d(dim_out, dim_out, kernel_size=4, stride=2, padding=1)
         
     def forward(self, x):
-        return self.conv(x)
+        b = x.shape[0]
+        x = rearrange(x, 'b d t f -> (b f) d t')
+        x = self.conv_t(x)
+        x = rearrange(x, '(b f) d t -> (b t) d f', b=b)
+        x = self.conv_f(x)
+        x = rearrange(x, '(b t) d f -> b d t f', b=b)
+        return x
 
 class ResnetBlock(nn.Module):
     def __init__(self, dim, dim_out):

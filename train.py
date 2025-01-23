@@ -385,6 +385,15 @@ def get_model(model_name):
             n_heads=12,
             patch_size=(2, 2)
         )
+    elif model_name == "BSRoformer15a_layerscale_small_p22":
+        from models.bs_roformer15_layerscale import BSRoformer15a
+        return BSRoformer15a(
+            input_channels=2,
+            depth=6,
+            dim=384,
+            n_heads=12,
+            patch_size=(2, 2)
+        )
     elif model_name == "BSRoformer15a_cnnunet_small":
         from models.bs_roformer15_cnnunet import BSRoformer15a
         return BSRoformer15a(
@@ -455,6 +464,7 @@ def get_model(model_name):
             # dim=384,
             # n_heads=12
         )
+    # 18a: cnnunet_small
     elif model_name == "BSRoformer18a":
         from models.bs_roformer18 import BSRoformer18
         return BSRoformer18(
@@ -495,6 +505,7 @@ def get_model(model_name):
             mid_transformer_depth=3,
             attn_dim_head=32
         )
+    # Add layer scale
     elif model_name == "BSRoformer19a":
         from models.bs_roformer19 import BSRoformer19
         return BSRoformer19(
@@ -504,7 +515,81 @@ def get_model(model_name):
             block_types=["resnet", "resnet"],
             mid_transformer_depth=12,
             attn_dim_head=32
-        ) 
+        )
+    elif model_name == "BSRoformer19b":
+        from models.bs_roformer19 import BSRoformer19
+        return BSRoformer19(
+            dim=96,
+            dim_mults=[1, 2, 4, 8],
+            depths=[3, 3, 3],
+            block_types=["resnet", "resnet", "bsroformer"],
+            mid_transformer_depth=8,
+            attn_dim_head=32
+        )
+    elif model_name == "BSRoformer19c":
+        from models.bs_roformer19 import BSRoformer19
+        return BSRoformer19(
+            dim=96,
+            dim_mults=[1, 2, 4, 8],
+            depths=[3, 3, 3],
+            block_types=["resnet", "resnet", "resnet+bsroformer"],
+            mid_transformer_depth=8,
+            attn_dim_head=32
+        )
+    elif model_name == "BSRoformer19d":
+        from models.bs_roformer19 import BSRoformer19
+        return BSRoformer19(
+            dim=96,
+            dim_mults=[1, 2, 4, 8],
+            depths=[3, 3, 3],
+            block_types=["resnet", "resnet", "resnet+bsroformer"],
+            mid_transformer_depth=12,
+            attn_dim_head=32
+        )
+    # Add separated downsampled path (not kept)
+    elif model_name == "BSRoformer20a":
+        from models.bs_roformer20 import BSRoformer20
+        return BSRoformer20(
+            dim=96,
+            dim_mults=[1, 2, 4],
+            depths=[2, 2],
+            block_types=["resnet", "resnet"],
+            mid_transformer_depth=12,
+            attn_dim_head=32
+        )
+    # based on 19, added QK Norm, SwiGLU, Linear Attention
+    elif model_name == "BSRoformer21a":
+        from models.bs_roformer21 import BSRoformer21
+        return BSRoformer21(
+            dim=96,
+            dim_mults=[1, 2, 4],
+            depths=[2, 2],
+            block_types=["resnet", "resnet"],
+            mid_transformer_depth=6,
+            attn_dim_head=32
+        )
+    # 21 + interleaved downsample path
+    elif model_name == "BSRoformer22a":
+        from models.bs_roformer22 import BSRoformer22
+        return BSRoformer22(
+            dim=96,
+            dim_mults=[1, 2, 4],
+            depths=[2, 2],
+            block_types=["resnet", "resnet"],
+            mid_transformer_depth=6,
+            attn_dim_head=32
+        )
+    # 22 + interleaved resnet blocks
+    elif model_name == "BSRoformer23a":
+        from models.bs_roformer23 import BSRoformer23
+        return BSRoformer23(
+            dim=96,
+            dim_mults=[1, 2, 4],
+            depths=[2, 2],
+            block_types=["resnet", "interleaved_resnet"],
+            mid_transformer_depth=6,
+            attn_dim_head=32
+        )
     elif model_name == "BSRoformerUNet":
         from models.bs_roformer_unet import BSRoformerUNet
         return BSRoformerUNet(

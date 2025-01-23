@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio
 from einops import rearrange
+from einops.layers.torch import Rearrange
 import numpy as np
 import librosa
 from rotary_embedding_torch import RotaryEmbedding, apply_rotary_emb
@@ -10,7 +11,7 @@ from rotary_embedding_torch import RotaryEmbedding, apply_rotary_emb
 from models.fourier import Fourier
 
 
-class BSRoformer19(Fourier):
+class BSRoformer23(Fourier):
     def __init__(
         self,
         n_fft: int = 2048,
@@ -63,7 +64,9 @@ class BSRoformer19(Fourier):
             blocks = nn.ModuleList([])
             for _ in range(depth):
                 if block_type == 'resnet':
-                    blocks.append(ResnetBlock(dim_in, dim_in))
+                    blocks.append(ResnetBlock(dim_in, dim_in, kernel_size=3, padding=1))
+                elif block_type == 'interleaved_resnet':
+                    blocks.append(InterleavedResnetBlock(dim_in, dim_in))
                 elif block_type == 'bsroformer':
                     blocks.append(BSRoformerBlock(dim_in, dim_in // attn_dim_head, rotary_emb_t, rotary_emb_f))
                 elif block_type == 'resnet+bsroformer':
@@ -87,7 +90,9 @@ class BSRoformer19(Fourier):
             blocks = nn.ModuleList([])
             for _ in range(depth):
                 if block_type == 'resnet':
-                    blocks.append(ResnetBlock(dim_in + dim_out, dim_out))
+                    blocks.append(ResnetBlock(dim_in + dim_out, dim_out, kernel_size=3, padding=1))
+                elif block_type == 'interleaved_resnet':
+                    blocks.append(InterleavedResnetBlock(dim_in + dim_out, dim_out))
                 elif block_type == 'bsroformer':
                     blocks.append(nn.Sequential(
                         nn.Conv2d(dim_in + dim_out, dim_out, 1),
@@ -95,7 +100,7 @@ class BSRoformer19(Fourier):
                     ))
                 elif block_type == 'resnet+bsroformer':
                     blocks.append(nn.Sequential(
-                        ResnetBlock(dim_in + dim_out, dim_out),
+                        ResnetBlock(dim_in + dim_out, dim_out, kernel_size=3, padding=1),
                         BSRoformerBlock(dim_out, dim_out // attn_dim_head, rotary_emb_t, rotary_emb_f)
                     ))
                 else:
@@ -103,7 +108,7 @@ class BSRoformer19(Fourier):
             blocks.append(Upsample(dim_out, dim_in) if not is_last else nn.Conv2d(dim_out, dim_in, 1))
             self.ups.append(blocks)
 
-        self.final_resblock = ResnetBlock(init_dim * 2, init_dim)
+        self.final_resblock = InterleavedResnetBlock(init_dim * 2, init_dim)
         self.final_conv = nn.Conv2d(init_dim, out_channels, kernel_size=1)
         
     def forward(self, mixture):
@@ -181,44 +186,6 @@ class BSRoformer19(Fourier):
 
         return output
 
-class Downsample(nn.Module):
-    def __init__(self, dim_in, dim_out):
-        super().__init__()
-        self.conv = nn.Conv2d(dim_in, dim_out, kernel_size=2, stride=2, padding=(0, 0))
-        
-    def forward(self, x):
-        return self.conv(x)
-
-class Upsample(nn.Module):
-    def __init__(self, dim_in, dim_out):
-        super().__init__()
-        self.conv = nn.ConvTranspose2d(dim_in, dim_out, kernel_size=2, stride=2, padding=(0, 0))
-        
-    def forward(self, x):
-        return self.conv(x)
-
-class ResnetBlock(nn.Module):
-    def __init__(self, dim, dim_out):
-        super().__init__()
-        self.block1 = nn.Sequential(
-            nn.Conv2d(dim, dim_out, kernel_size=3, stride=1, padding=1),
-            RMSNorm2d(dim_out),
-            nn.SiLU(),
-        )
-        
-        self.block2 = nn.Sequential(
-            nn.Conv2d(dim_out, dim_out, kernel_size=3, stride=1, padding=1),
-            RMSNorm2d(dim_out),
-            nn.SiLU(),
-        )
-        
-        self.res_conv = nn.Conv2d(dim, dim_out, kernel_size=1, stride=1, padding=0) if dim != dim_out else nn.Identity()
-    
-    def forward(self, x):
-        h = self.block1(x)
-        h = self.block2(h)
-        return h + self.res_conv(x)
-
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         r"""https://github.com/meta-llama/llama/blob/main/llama/model.py"""
@@ -241,6 +208,73 @@ class RMSNorm2d(RMSNorm):
         x = rearrange(x, 'b c h w -> b (h w) c')
         x = super().forward(x)
         return rearrange(x, 'b (h w) c -> b c h w', h=h, w=w)
+
+class Downsample(nn.Module):
+    def __init__(self, dim_in, dim_out):
+        super().__init__()
+        self.conv_t = nn.Conv2d(dim_in, dim_out, kernel_size=(4, 1), stride=(2, 1), padding=(1, 0))
+        self.conv_f = nn.Conv2d(dim_out, dim_out, kernel_size=(1, 4), stride=(1, 2), padding=(0, 1))
+        
+    def forward(self, x):
+        x = self.conv_t(x)
+        x = self.conv_f(x)
+        return x
+
+class Upsample(nn.Module):
+    def __init__(self, dim_in, dim_out):
+        super().__init__()
+        self.conv_t = nn.ConvTranspose2d(dim_in, dim_out, kernel_size=(4, 1), stride=(2, 1), padding=(1, 0))
+        self.conv_f = nn.ConvTranspose2d(dim_out, dim_out, kernel_size=(1, 4), stride=(1, 2), padding=(0, 1))
+        
+    def forward(self, x):
+        x = self.conv_t(x)
+        x = self.conv_f(x)
+        return x
+
+class Transpose(nn.Module):
+    def __init__(self):
+        super().__init__()
+    def forward(self, x):
+        return x.transpose(-2, -1)
+
+class Block(nn.Module):
+    def __init__(self, dim, dim_out, **kwargs):
+        super().__init__()
+        self.conv = nn.Conv2d(dim, dim_out, **kwargs)
+        self.norm = RMSNorm2d(dim_out)
+        self.act = nn.SiLU()
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.norm(x)
+        x = self.act(x)
+        return x
+
+class ResnetBlock(nn.Module):
+    def __init__(self, dim, dim_out, **kwargs):
+        super().__init__()
+        self.block1 = Block(dim, dim_out, **kwargs)
+        self.block2 = Block(dim_out, dim_out, **kwargs)
+        
+        self.res_conv = nn.Conv2d(dim, dim_out, kernel_size=1, stride=1, padding=0) if dim != dim_out else nn.Identity()
+    
+    def forward(self, x):
+        h = self.block1(x)
+        h = self.block2(h)
+        return h + self.res_conv(x)
+    
+
+class InterleavedResnetBlock(nn.Module):
+    def __init__(self, dim, dim_out):
+        super().__init__()
+        self.block = ResnetBlock(dim, dim_out, kernel_size=3, padding=1)
+        self.block_t = ResnetBlock(dim_out, dim_out, kernel_size=(3, 1), padding=(1, 0))
+        self.block_f = ResnetBlock(dim_out, dim_out, kernel_size=(1, 3), padding=(0, 1))
+    
+    def forward(self, x):
+        x = self.block(x)
+        x = self.block_t(x)
+        x = self.block_f(x)
+        return x
 
 class StftToImage(nn.Module):
 
@@ -339,13 +373,14 @@ class MLP(nn.Module):
     def __init__(self, dim: int) -> None:
         super().__init__()
 
-        self.fc1 = nn.Linear(dim, 4 * dim, bias=False)
+        self.fc1 = nn.Linear(dim, 8 * dim, bias=False)
         self.silu = nn.SiLU()
         self.fc2 = nn.Linear(4 * dim, dim, bias=False)
 
     def forward(self, x):
         x = self.fc1(x)
-        x = self.silu(x)
+        x, gate = x.chunk(2, dim=-1)
+        x = self.silu(x) * gate
         x = self.fc2(x)
         return x
 
@@ -363,6 +398,9 @@ class Attention(nn.Module):
 
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         assert self.flash, "Must have flash attention."
+        
+        self.q_norm = RMSNorm(dim // n_heads)
+        self.k_norm = RMSNorm(dim // n_heads)
         
         self.c_attn = nn.Linear(dim, 3 * dim, bias=False)
         self.c_proj = nn.Linear(dim, dim, bias=False)
@@ -383,6 +421,9 @@ class Attention(nn.Module):
 
         q, k, v = rearrange(self.c_attn(x), 'b t (r h d) -> r b h t d', r=3, h=self.n_heads)
         # q, k, v: (b, h, t, d)
+        
+        q = self.q_norm(q)
+        k = self.k_norm(k)
 
         q = self.rotary_emb.rotate_queries_or_keys(q)
         k = self.rotary_emb.rotate_queries_or_keys(k)
@@ -397,7 +438,10 @@ class Attention(nn.Module):
 
         return y
 
-class Attention2d(nn.Module):
+def l2norm(t):
+    return F.normalize(t, dim = -1, p = 2)
+
+class LinearAttention2d(nn.Module):
     def __init__(self, dim: int, n_heads: int):
         super().__init__()
         self.dim = dim
@@ -406,24 +450,27 @@ class Attention2d(nn.Module):
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         assert self.flash, "Must have flash attention."
         
-        self.qkv = nn.Conv2d(dim, dim * 3, 1, bias=False)
-        self.c_proj = nn.Conv2d(dim, dim, 1, bias=False)
+        self.temperature = nn.Parameter(torch.zeros(n_heads, 1, 1))
+        
+        self.qkv = nn.Linear(dim, dim * 3, bias=False)
+        self.c_proj = nn.Linear(dim, dim, bias=False)
     
     def forward(self, x):
-        H, W = x.shape[-2:]
-        q, k, v = self.qkv(x).chunk(3, dim=1)
-        q, k, v = map(lambda t: rearrange(t, 'b (h c) x y -> b h (x y) c', h=self.n_heads), (q, k, v))
+        q, k, v = self.qkv(x).chunk(3, dim=-1)
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h d n', h=self.n_heads), (q, k, v))
+        
+        q, k = map(l2norm, (q, k))
+        q = q * self.temperature.exp()
         
         if self.flash:
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0, is_causal=False)
+            out = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0, is_causal=False)
         
-        y = rearrange(y, 'b h (x y) c -> b (h c) x y', x=H, y=W)
-        y = self.c_proj(y)
+        out = rearrange(out, 'b h d n -> b n (h d)')
         
-        return y
+        return self.c_proj(out)
 
 class TransformerBlock(nn.Module):
-    def __init__(self, dim: int, n_heads: int, rotary_emb: RotaryEmbedding):
+    def __init__(self, dim: int, n_heads: int, rotary_emb: RotaryEmbedding=None, linear_attn=False):
         
         super().__init__()
         self.dim = dim
@@ -431,7 +478,7 @@ class TransformerBlock(nn.Module):
         
         self.att_norm = RMSNorm(dim)
         self.ffn_norm = RMSNorm(dim)
-        self.att = LayerScale(dim, Attention(dim=dim, n_heads=n_heads, rotary_emb=rotary_emb))
+        self.att = LayerScale(dim, Attention(dim=dim, n_heads=n_heads, rotary_emb=rotary_emb) if not linear_attn else LinearAttention2d(dim=dim, n_heads=n_heads))
         self.mlp = LayerScale(dim, MLP(dim=dim))
         
 
@@ -446,11 +493,14 @@ class TransformerBlock(nn.Module):
 class BSRoformerBlock(nn.Module):
     def __init__(self, dim: int, n_heads: int, rotary_emb_t: RotaryEmbedding, rotary_emb_f: RotaryEmbedding):
         super().__init__()
+        self.transformer = TransformerBlock(dim=dim, n_heads=n_heads, linear_attn=True)
         self.transformer_t = TransformerBlock(dim=dim, n_heads=n_heads, rotary_emb=rotary_emb_t)
         self.transformer_f = TransformerBlock(dim=dim, n_heads=n_heads, rotary_emb=rotary_emb_f)
     def forward(self, x):
-        b = x.size(0)
-        x = rearrange(x, 'b d t f -> (b f) t d')
+        b, t = x.size(0), x.size(2)
+        x = rearrange(x, 'b d t f -> b (t f) d')
+        x = self.transformer(x)
+        x = rearrange(x, 'b (t f) d -> (b f) t d', t=t)
         x = self.transformer_t(x)
         x = rearrange(x, '(b f) t d -> (b t) f d', b=b)
         x = self.transformer_f(x)
