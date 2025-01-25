@@ -15,7 +15,6 @@ from torch import nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from copy import deepcopy
-from auraloss.freq import MultiResolutionSTFTLoss
 
 import wandb
 
@@ -78,7 +77,7 @@ def train(args):
     model = get_model(model_name)
 
     # EMA
-    ema = get_model(model_name)
+    ema = deepcopy(model)
     requires_grad(ema, False)
     update_ema(ema, model, decay=0)  # Ensure EMA is initialized with synced weights
     ema.eval()  # EMA model should always be in eval mode
@@ -91,7 +90,7 @@ def train(args):
 
     # Prepare for multiprocessing
     process_group_kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=7200))
-    accelerator = Accelerator(mixed_precision="bf16", kwargs_handlers=[process_group_kwargs])
+    accelerator = Accelerator(mixed_precision="bf16", step_scheduler_with_optimizer=False, kwargs_handlers=[process_group_kwargs])
 
     # Logger
     wandb_log = accelerator.is_local_main_process and wandb_log
@@ -104,6 +103,7 @@ def train(args):
             project="mini_source_separation", 
             config=config, 
             name="{} {}".format(model_name, str(train_dataset.remix_weights)),
+            magic=True
         )
 
     model, ema, optimizer, train_dataloader, scheduler = accelerator.prepare(
@@ -122,16 +122,7 @@ def train(args):
         else:
             print(f"Total parameters: {total_params}")
     
-    mrstft_loss = MultiResolutionSTFTLoss(
-        fft_sizes=[2048, 1024, 512, 256, 128, 64, 32],
-        hop_sizes=[512, 256, 128, 64, 32, 16, 8],
-        win_lengths=[2048, 1024, 512, 256, 128, 64, 32],
-        w_sc=0.0,
-        w_log_mag=0.0,
-        w_lin_mag=1.0,
-    )        
-    
-    pbar = tqdm(train_dataloader)
+    pbar = tqdm(train_dataloader, dynamic_ncols=True, disable=not accelerator.is_local_main_process)
     for step, data in enumerate(pbar):
 
         mixture = data["mixture"]
@@ -145,7 +136,6 @@ def train(args):
             
             # Calculate loss
             loss = l1_loss(output, target)
-            # loss += mrstft_loss(output, target)
             
         if accelerator.is_main_process:
             pbar.set_postfix({"loss": loss.item(), "lr": scheduler.get_last_lr()[0]})
@@ -165,11 +155,11 @@ def train(args):
         update_ema(ema_model=ema, model=accelerator.unwrap_model(model))
 
         # Learning rate scheduler (optional)
-        if use_scheduler and accelerator.is_main_process:
+        if use_scheduler:
             scheduler.step()
         
         # Evaluate
-        if step % test_step_frequency == 0:
+        if (step+1) % test_step_frequency == 0:
 
             accelerator.wait_for_everyone()
 
@@ -229,7 +219,7 @@ def train(args):
                     )
         
         # Save model.
-        if step % save_step_frequency == 0:
+        if (step+1) % save_step_frequency == 0:
 
             accelerator.wait_for_everyone()
 
