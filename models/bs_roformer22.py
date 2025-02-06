@@ -11,6 +11,10 @@ from rotary_embedding_torch import RotaryEmbedding, apply_rotary_emb
 from models.fourier import Fourier
 
 
+def checkpoint(function, *args, **kwargs):
+    kwargs.setdefault("use_reentrant", False)
+    return torch.utils.checkpoint.checkpoint(function, *args, **kwargs)
+
 class BSRoformer22(Fourier):
     def __init__(
         self,
@@ -23,6 +27,7 @@ class BSRoformer22(Fourier):
         block_types: list = ['resnet', 'resnet', 'resnet'],
         mid_transformer_depth: int = 6,
         attn_dim_head: int = 32,
+        dropout: float = 0.0,
     ):
         super().__init__(n_fft, hop_length)
 
@@ -80,7 +85,7 @@ class BSRoformer22(Fourier):
         self.transformers = nn.ModuleList([])
 
         for _ in range(mid_transformer_depth):
-            self.transformers.append(BSRoformerBlock(dim_out, dim_out // attn_dim_head, rotary_emb_t, rotary_emb_f))
+            self.transformers.append(BSRoformerBlock(dim_out, dim_out // attn_dim_head, rotary_emb_t, rotary_emb_f, dropout=dropout))
         
         self.ups = nn.ModuleList([])
         for i, ((dim_in, dim_out), block_type, depth) in enumerate(zip(reversed(in_out), reversed(block_types), reversed(depths))):
@@ -153,7 +158,8 @@ class BSRoformer22(Fourier):
         # shape: (b, d, t, f)
 
         for transformer in self.transformers:
-            x = transformer(x)
+            # x = transformer(x)
+            x = checkpoint(transformer, x)
 
         for stage in self.ups:
             blocks, up = stage[:-1], stage[-1]
@@ -375,24 +381,26 @@ class LayerScale(nn.Module):
         return self.fn(x, **kwargs) * self.scale
 
 class MLP(nn.Module):
-    def __init__(self, dim: int) -> None:
+    def __init__(self, dim: int, dropout: float = 0.) -> None:
         super().__init__()
 
         self.fc1 = nn.Linear(dim, 8 * dim, bias=False)
         self.silu = nn.SiLU()
+        self.dropout = nn.Dropout(dropout)
         self.fc2 = nn.Linear(4 * dim, dim, bias=False)
 
     def forward(self, x):
         x = self.fc1(x)
         x, gate = x.chunk(2, dim=-1)
         x = self.silu(x) * gate
+        x = self.dropout(x)
         x = self.fc2(x)
         return x
 
 
 class Attention(nn.Module):
 
-    def __init__(self, dim: int, n_heads: int, rotary_emb: RotaryEmbedding):
+    def __init__(self, dim: int, n_heads: int, rotary_emb: RotaryEmbedding, dropout=0.):
         super().__init__()
         
         assert dim % n_heads == 0
@@ -409,6 +417,7 @@ class Attention(nn.Module):
         
         self.c_attn = nn.Linear(dim, 3 * dim, bias=False)
         self.c_proj = nn.Linear(dim, dim, bias=False)
+        self.dropout = nn.Dropout(dropout)
         
     def forward(self, x):
         r"""
@@ -440,6 +449,8 @@ class Attention(nn.Module):
 
         y = self.c_proj(y)
         # shape: (b, t, h*d)
+        
+        y = self.dropout(y)
 
         return y
 
@@ -447,7 +458,7 @@ def l2norm(t):
     return F.normalize(t, dim = -1, p = 2)
 
 class LinearAttention2d(nn.Module):
-    def __init__(self, dim: int, n_heads: int):
+    def __init__(self, dim: int, n_heads: int, dropout: float = 0.):
         super().__init__()
         self.dim = dim
         self.n_heads = n_heads
@@ -459,6 +470,7 @@ class LinearAttention2d(nn.Module):
         
         self.qkv = nn.Linear(dim, dim * 3, bias=False)
         self.c_proj = nn.Linear(dim, dim, bias=False)
+        self.dropout = nn.Dropout(dropout)
     
     def forward(self, x):
         q, k, v = self.qkv(x).chunk(3, dim=-1)
@@ -472,10 +484,14 @@ class LinearAttention2d(nn.Module):
         
         out = rearrange(out, 'b h d n -> b n (h d)')
         
-        return self.c_proj(out)
+        out = self.c_proj(out)
+        
+        out = self.dropout(out)
+        
+        return out
 
 class TransformerBlock(nn.Module):
-    def __init__(self, dim: int, n_heads: int, rotary_emb: RotaryEmbedding=None, linear_attn=False):
+    def __init__(self, dim: int, n_heads: int, rotary_emb: RotaryEmbedding=None, linear_attn=False, dropout=0.):
         
         super().__init__()
         self.dim = dim
@@ -483,8 +499,8 @@ class TransformerBlock(nn.Module):
         
         self.att_norm = RMSNorm(dim)
         self.ffn_norm = RMSNorm(dim)
-        self.att = LayerScale(dim, Attention(dim=dim, n_heads=n_heads, rotary_emb=rotary_emb) if not linear_attn else LinearAttention2d(dim=dim, n_heads=n_heads))
-        self.mlp = LayerScale(dim, MLP(dim=dim))
+        self.att = LayerScale(dim, Attention(dim=dim, n_heads=n_heads, rotary_emb=rotary_emb, dropout=dropout) if not linear_attn else LinearAttention2d(dim=dim, n_heads=n_heads))
+        self.mlp = LayerScale(dim, MLP(dim=dim, dropout=dropout))
         
 
     def forward(
@@ -496,11 +512,11 @@ class TransformerBlock(nn.Module):
         return x
 
 class BSRoformerBlock(nn.Module):
-    def __init__(self, dim: int, n_heads: int, rotary_emb_t: RotaryEmbedding, rotary_emb_f: RotaryEmbedding):
+    def __init__(self, dim: int, n_heads: int, rotary_emb_t: RotaryEmbedding, rotary_emb_f: RotaryEmbedding, dropout: float = 0.):
         super().__init__()
-        self.transformer = TransformerBlock(dim=dim, n_heads=n_heads, linear_attn=True)
-        self.transformer_t = TransformerBlock(dim=dim, n_heads=n_heads, rotary_emb=rotary_emb_t)
-        self.transformer_f = TransformerBlock(dim=dim, n_heads=n_heads, rotary_emb=rotary_emb_f)
+        self.transformer = TransformerBlock(dim=dim, n_heads=n_heads, linear_attn=True, dropout=dropout)
+        self.transformer_t = TransformerBlock(dim=dim, n_heads=n_heads, rotary_emb=rotary_emb_t, dropout=dropout)
+        self.transformer_f = TransformerBlock(dim=dim, n_heads=n_heads, rotary_emb=rotary_emb_f, dropout=dropout)
     def forward(self, x):
         b, t = x.size(0), x.size(2)
         x = rearrange(x, 'b d t f -> b (t f) d')

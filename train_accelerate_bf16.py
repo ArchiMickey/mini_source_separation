@@ -50,7 +50,7 @@ def train(args):
 
     checkpoints_dir = Path("./checkpoints", filename, model_name)
     
-    root = "/datasets/musdb18hq"
+    root = "/root/autodl-tmp/musdb18hq"
 
     # Training dataset
     train_dataset = MUSDB18HQ(

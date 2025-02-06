@@ -579,6 +579,37 @@ def get_model(model_name):
             mid_transformer_depth=6,
             attn_dim_head=32
         )
+    elif model_name == "BSRoformer22b":
+        from models.bs_roformer22 import BSRoformer22
+        return BSRoformer22(
+            dim=128,
+            dim_mults=[1, 2, 4],
+            depths=[2, 2],
+            block_types=["resnet", "resnet"],
+            mid_transformer_depth=12,
+            attn_dim_head=32
+        )
+    elif model_name == "BSRoformer22c":
+        from models.bs_roformer22 import BSRoformer22
+        return BSRoformer22(
+            dim=128,
+            dim_mults=[1, 2, 4],
+            depths=[2, 4],
+            block_types=["resnet", "resnet"],
+            mid_transformer_depth=0,
+            attn_dim_head=32
+        )
+    elif model_name == "BSRoformer22d":
+        from models.bs_roformer22 import BSRoformer22
+        return BSRoformer22(
+            dim=96,
+            dim_mults=[1, 2, 4],
+            depths=[2, 2],
+            block_types=["resnet", "resnet"],
+            mid_transformer_depth=12,
+            attn_dim_head=32,
+            dropout=0.1
+        )
     # 22 + interleaved resnet blocks
     elif model_name == "BSRoformer23a":
         from models.bs_roformer23 import BSRoformer23

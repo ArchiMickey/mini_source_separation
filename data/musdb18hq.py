@@ -95,7 +95,7 @@ class MUSDB18HQ(Dataset):
         )[0]
 
         audio_path = Path(self.audios_dir, audio_name, "mixture.wav")
-        audio_duration = librosa.get_duration(filename=audio_path)
+        audio_duration = librosa.get_duration(path=audio_path)
 
         start_time_dict = self.get_start_times(
             audio_duration=audio_duration, 
