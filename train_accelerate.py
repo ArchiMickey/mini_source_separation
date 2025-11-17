@@ -10,11 +10,12 @@ from accelerate import Accelerator, InitProcessGroupKwargs
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+
 import wandb
 # import trackio as wandb
 from mss.utils import parse_yaml, requires_grad, update_ema
-from train import (get_dataset, get_loss_fn, get_model,
-                   get_optimizer_and_scheduler, get_sampler, validate)
+from train import get_dataset, get_model, get_optimizer_and_scheduler, get_sampler, validate
+from mss.losses import get_loss_fn
 
 
 def train(args) -> None:
@@ -27,10 +28,8 @@ def train(args) -> None:
     
     # Configs
     configs = parse_yaml(config_path)
-    device = configs["train"]["device"]
     precision = configs["train"]["precision"]
     valid_num = configs["validate"]["audios_num"]
-    fast_only = configs["validate"]["fast_only"]
 
     # Checkpoints directory
     config_name = Path(config_path).stem
@@ -56,13 +55,7 @@ def train(args) -> None:
     model = get_model(
         configs=configs, 
         ckpt_path=configs["train"]["resume_ckpt_path"]
-    ).to(device)
-
-    # EMA
-    ema = deepcopy(model).to(device)
-    requires_grad(ema, False)
-    update_ema(ema, model, decay=0)  # Ensure EMA is initialized with synced weights
-    ema.eval()  # EMA model should always be in eval mode
+    )
 
     # Loss function
     loss_fn = get_loss_fn(configs)
@@ -72,27 +65,45 @@ def train(args) -> None:
         configs=configs, 
         params=model.parameters()
     )
+    max_grad_norm = configs["train"].get("max_grad_norm", 1e10)
 
     # Prepare for acceleration
-    print(f"Mixed precision: {precision}")
     process_group_kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=7200))
+    
     accelerator = Accelerator(
+        log_with="wandb" if wandb_log else None,
         mixed_precision=precision, 
-        kwargs_handlers=[process_group_kwargs]
+        kwargs_handlers=[process_group_kwargs],
+        step_scheduler_with_optimizer=False
     )
-
+    
+    if accelerator.is_main_process:
+        print(f"Mixed precision: {precision}")
+    
+    # EMA
+    if accelerator.is_main_process:
+        ema = deepcopy(model)
+        requires_grad(ema, False)
+        update_ema(ema, model, decay=0)  # Ensure EMA is initialized with synced weights
+        ema.eval()  # EMA model should always be in eval mode
+        ema.to(accelerator.device)
+        
     model, optimizer, train_dataloader = accelerator.prepare(
         model, optimizer, train_dataloader)
 
-    ema.to(accelerator.device)
-
     # Logger
     if wandb_log:
-        wandb.init(project="mss", name=f"{config_name}")
+        accelerator.init_trackers(
+            project_name="mss",
+            init_kwargs={
+                "wandb": {"name": configs.get("name", filename)}
+            },
+            config=configs,
+        )
 
     # Train
-    for step, data in enumerate(tqdm(train_dataloader)):
-
+    pbar = tqdm(train_dataloader, disable=not accelerator.is_main_process)    
+    for step, data in enumerate(pbar):
         # ------ 1. Training ------
         # 1.1 Data
         target = data["target"]
@@ -103,64 +114,74 @@ def train(args) -> None:
         output = model(mixture)
 
         # 1.2 Loss
-        loss = loss_fn(output=output, target=target)
+        loss, loss_info = loss_fn(output=output, target=target)
         
         # 1.3 Optimize
         optimizer.zero_grad()  # Reset all parameter.grad to 0
         accelerator.backward(loss)  # Update all parameter.grad
+        
+        if accelerator.sync_gradients:
+            if max_grad_norm is not None:
+                grad_norm = accelerator.clip_grad_norm_(
+                    model.parameters(), max_grad_norm)
+                if hasattr(grad_norm, "item"):
+                    grad_norm = grad_norm.item()
+        
         optimizer.step()  # Update all parameters based on all parameter.grad
         scheduler.step()
-        update_ema(ema, model, decay=0.999)
+        if accelerator.sync_gradients and accelerator.is_main_process:
+            update_ema(ema, model, decay=0.999)
 
-        if step % 100 == 0:
-            print(loss)
-
+        pbar.set_postfix({"loss": loss.item(), "lr": scheduler.get_last_lr()[0], "grad_norm": grad_norm, **loss_info})
+        accelerator.log(dict(
+            loss=loss.item(),
+            lr=scheduler.get_last_lr()[0],
+            grad_norm=grad_norm,
+            **loss_info
+        ), step=step)
+        
         # ------ 2. Evaluation ------
         # 2.1 Evaluate
-        if step % configs["train"]["test_every_n_steps"] == 0 and accelerator.is_main_process:
+        if (step + 1) % configs["train"]["test_every_n_steps"] == 0 and accelerator.is_main_process:
 
             train_sdr = validate(
                 configs=configs,
-                model=accelerator.unwrap_model(ema),
+                model=ema,
                 split="train",
                 audios_num=valid_num,
-                fast_only=fast_only
             )
 
             test_sdr = validate(
                 configs=configs,
-                model=accelerator.unwrap_model(ema),
+                model=ema,
                 split="test",
                 audios_num=valid_num,
-                fast_only=fast_only
             )
 
-            if wandb_log:
-                wandb.log(
-                    data={
-                        "train_sdr": train_sdr, 
-                        "test_sdr": test_sdr,
-                    },
-                    step=step
-                )
+            accelerator.log(
+                {
+                    "train_sdr": train_sdr, 
+                    "test_sdr": test_sdr,
+                },
+                step=step
+            )
 
             print("====== Overall metrics ====== ")
             print(f"Train SDR fast: {train_sdr:.2f}")
-            print(f"Test SDR fast: {train_sdr:.2f}")
+            print(f"Test SDR fast: {test_sdr:.2f}")
+        
         
         # 2.2 Save model
-        if step % configs["train"]["save_every_n_steps"] == 0 and accelerator.is_main_process:
-            
+        if (step + 1) % configs["train"]["save_every_n_steps"] == 0 and accelerator.is_main_process:
             ckpt_path = Path(ckpts_dir, f"step={step}_ema.pth")
-            torch.save(accelerator.unwrap_model(ema).state_dict(), ckpt_path)
+            torch.save(ema.state_dict(), ckpt_path)
             print("Save model to {}".format(ckpt_path))
 
-        if step == configs["train"]["training_steps"]:
+        if (step + 1) == configs["train"]["training_steps"]:
             break
         
 
 if __name__ == "__main__":
-
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True, help="Path of config yaml.")
     parser.add_argument("--no_log", action="store_true", default=False)

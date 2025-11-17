@@ -16,8 +16,8 @@ from tqdm import tqdm
 
 import wandb
 # import trackio as wandb
-from mss.utils import (parse_yaml, requires_grad, update_ema, LinearWarmUp, 
-    separate_overlap_add, calculate_sdr)
+from ema_pytorch import EMA
+from mss.utils import (parse_yaml, LinearWarmUp, separate_overlap_add, calculate_sdr)
 
 
 def train(args) -> None:
@@ -27,7 +27,7 @@ def train(args) -> None:
     config_path = args.config
     wandb_log = not args.no_log
     filename = Path(__file__).stem
-    
+
     # Configs
     configs = parse_yaml(config_path)
     device = configs["train"]["device"]
@@ -60,10 +60,7 @@ def train(args) -> None:
     ).to(device)
 
     # EMA
-    ema = deepcopy(model).to(device)
-    requires_grad(ema, False)
-    update_ema(ema, model, decay=0)  # Ensure EMA is initialized with synced weights
-    ema.eval()  # EMA model should always be in eval mode
+    ema = EMA(model, beta=0.9999, update_after_step=1, update_every=1, power=3/4)
 
     # Loss function
     loss_fn = get_loss_fn(configs)
@@ -92,13 +89,12 @@ def train(args) -> None:
 
         # 1.2 Loss
         loss = loss_fn(output=output, target=target)
-        
+
         # 1.3 Optimize
         optimizer.zero_grad()  # Reset all parameter.grad to 0
         loss.backward()  # Update all parameter.grad
         optimizer.step()  # Update all parameters based on all parameter.grad
         scheduler.step()
-        update_ema(ema, model, decay=0.999)
 
         if step % 100 == 0:
             print(loss)
@@ -136,14 +132,14 @@ def train(args) -> None:
         
         # 2.2 Save model
         if step % configs["train"]["save_every_n_steps"] == 0:
-            
+
             ckpt_path = Path(ckpts_dir, f"step={step}_ema.pth")
             torch.save(ema.state_dict(), ckpt_path)
             print("Save model to {}".format(ckpt_path))
 
         if step == configs["train"]["training_steps"]:
             break
-        
+
 
 def get_dataset(
     configs: dict, 
@@ -177,7 +173,7 @@ def get_dataset(
             )
         else:
             raise ValueError(name)
-            
+
 
 def get_sampler(configs: dict, dataset: Dataset) -> Iterable:
     r"""Get sampler."""
@@ -194,17 +190,25 @@ def get_sampler(configs: dict, dataset: Dataset) -> Iterable:
 
 def get_model(
     configs: dict, 
-    ckpt_path: str
+    ckpt_path: str | None = None,
+    **kwargs
 ) -> nn.Module:
     r"""Initialize model."""
 
     name = configs["model"]["name"]
 
     if name == "BSRoformer":
-
         from mss.models.bsroformer import BSRoformer
-        model = BSRoformer(**configs["model"])
-
+        model = BSRoformer(**configs["model"], **kwargs)
+    elif name == "MMTransformer1D":
+        from mss.models.mmtransformer1d import BSRoformer
+        model = BSRoformer(**configs["model"], **kwargs)
+    elif name == "MMTransformer1D_1":
+        from mss.models.mmtransformer1d_1 import BSRoformer
+        model = BSRoformer(**configs["model"], **kwargs)
+    elif name == "MMTransformer1D_2":
+        from mss.models.mmtransformer1d_2 import BSRoformer
+        model = BSRoformer(**configs["model"], **kwargs)
     else:
         raise ValueError(name)    
 
@@ -221,7 +225,7 @@ def get_loss_fn(configs: dict) -> callable:
     loss_type = configs["train"]["loss"]
 
     if loss_type == "l1":
-        from mss.losses.l1 import l1
+        from mss.losses import l1
         return l1
 
     else:
@@ -248,7 +252,7 @@ def get_optimizer_and_scheduler(
         scheduler = None
 
     return optimizer, scheduler
-        
+
 
 def validate(
     configs: dict,
