@@ -78,7 +78,7 @@ def get_loss_fn(configs):
         elif loss_name == "mse":
             losses.append((loss_name, torch.nn.MSELoss(), weight))
         elif loss_name == "mrstft":
-            losses.append((loss_name, MultiResolutionSTFTLoss(), weight))
+            losses.append((loss_name, MultiResolutionSTFTLoss(hop_size=configs["model"]["hop_length"]), weight))
         else:
             raise ValueError(f"Unsupported loss: {loss_name}")
     return MultiLoss(losses)

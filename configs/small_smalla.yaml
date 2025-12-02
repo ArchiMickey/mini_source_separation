@@ -25,8 +25,8 @@ model:
     hop_length: 480
     n_bands: 256
     band_dim: 64
-    patch_size: [4, 4]
-    n_layers: 12
+    patch_size: [4, 16]
+    n_layers: 6
     n_heads: 12
     dim: 384
 

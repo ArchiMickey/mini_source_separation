@@ -18,15 +18,17 @@ test_datasets:
 sampler: RandomSongSampler
 
 model:
-    name: BSRoformer
+    name: BSRoformer_2a
     audio_channels: *audio_channels
     sample_rate: *sample_rate
     n_fft: 2048 
     hop_length: 480
-    n_bands: 256
+    n_bands: 64
     band_dim: 64
-    patch_size: [4, 4]
+    patch_size: [4, 1]
+    num_freq_registers: 64
     n_layers: 12
+    n_freq_layers: 6
     n_heads: 12
     dim: 384
 

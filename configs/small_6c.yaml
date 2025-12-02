@@ -18,7 +18,7 @@ test_datasets:
 sampler: RandomSongSampler
 
 model:
-    name: BSRoformer
+    name: BSRoformer_6
     audio_channels: *audio_channels
     sample_rate: *sample_rate
     n_fft: 2048 
@@ -26,7 +26,7 @@ model:
     n_bands: 256
     band_dim: 64
     patch_size: [4, 4]
-    n_layers: 12
+    n_layers: 6
     n_heads: 12
     dim: 384
 
@@ -38,7 +38,7 @@ train:
     - [mrstft, 1.0]
     optimizer: AdamW
     lr: 1e-4
-    max_grad_norm: 1.0 # Leave blank if no gradient clipping is used
+    max_grad_norm: 1000.0 # Leave blank if no gradient clipping is used
     warm_up_steps: 1000  # Leave blank if no warm up is used
     batch_size_per_device: 4
     test_every_n_steps: 20000

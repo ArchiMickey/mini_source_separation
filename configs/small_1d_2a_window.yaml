@@ -17,18 +17,23 @@ test_datasets:
         
 sampler: RandomSongSampler
 
+name: MMTransformer1D_2a_flex_window_200
+
 model:
-    name: BSRoformer
+    name: MMTransformer1D_2
     audio_channels: *audio_channels
     sample_rate: *sample_rate
     n_fft: 2048 
     hop_length: 480
     n_bands: 256
     band_dim: 64
-    patch_size: [4, 4]
-    n_layers: 12
+    patch_size: [1, 4]
+    window_size: [100, 99]
+    strides: [1, 2, 4, 2, 1]
+    n_layers: [2, 2, 4, 4, 4]
     n_heads: 12
     dim: 384
+    use_flex_attention: True
 
 train:
     num_workers: 32

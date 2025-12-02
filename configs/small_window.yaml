@@ -29,6 +29,7 @@ model:
     n_layers: 12
     n_heads: 12
     dim: 384
+    window_size: [5, 4]
 
 train:
     num_workers: 32

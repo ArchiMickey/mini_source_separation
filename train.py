@@ -18,6 +18,7 @@ import wandb
 # import trackio as wandb
 from ema_pytorch import EMA
 from mss.utils import (parse_yaml, LinearWarmUp, separate_overlap_add, calculate_sdr)
+from mss.datasets.augmentations import TransformCompose, RandomGain, RandomPitch
 
 
 def train(args) -> None:
@@ -157,7 +158,18 @@ def get_dataset(
     ds = f"{split}_datasets"
 
     for name in configs[ds].keys():
-    
+        stem_transform = None
+        if "transforms" in configs[ds][name]:
+            transform = []
+            for t_name in configs[ds][name]["transforms"]:
+                if t_name == "RandomGain":
+                    transform.append(RandomGain())
+                elif t_name == "RandomPitch":
+                    transform.append(RandomPitch(sr=sr))
+                else:
+                    raise ValueError(t_name)
+            stem_transform = TransformCompose(transform)
+            
         if name == "MUSDB18HQ":
             from mss.datasets.musdb18hq import MUSDB18HQ
             return MUSDB18HQ(
@@ -169,7 +181,7 @@ def get_dataset(
                 time_align=configs[ds][name]["time_align"],
                 mixture_transform=None,
                 group_transform=None,
-                stem_transform=None
+                stem_transform=stem_transform
             )
         else:
             raise ValueError(name)
@@ -196,18 +208,78 @@ def get_model(
     r"""Initialize model."""
 
     name = configs["model"]["name"]
-
+    
     if name == "BSRoformer":
         from mss.models.bsroformer import BSRoformer
         model = BSRoformer(**configs["model"], **kwargs)
+    elif name == "BSRoformer_1":
+        from mss.models.bsroformer_1 import BSRoformer
+        model = BSRoformer(**configs["model"], **kwargs)
+    elif name == "BSRoformer_2":
+        from mss.models.bsroformer_2 import BSRoformer
+        model = BSRoformer(**configs["model"], **kwargs)
+    elif name == "BSRoformer_2a":
+        from mss.models.bsroformer_2a import BSRoformer
+        model = BSRoformer(**configs["model"], **kwargs)
+    elif name == "BSRoformer_2b":
+        from mss.models.bsroformer_2b import BSRoformer
+        model = BSRoformer(**configs["model"], **kwargs)
+    elif name == "BSRoformer_3":
+        from mss.models.bsroformer_3 import BSRoformer
+        model = BSRoformer(**configs["model"], **kwargs)
+    elif name == "BSRoformer_4":
+        from mss.models.bsroformer_4 import BSRoformer
+        model = BSRoformer(**configs["model"], **kwargs)
+    elif name == "BSRoformer_5":
+        from mss.models.bsroformer_5 import BSRoformer
+        model = BSRoformer(**configs["model"], **kwargs)
+    elif name == "BSRoformer_6":
+        from mss.models.bsroformer_6 import BSRoformer
+        model = BSRoformer(**configs["model"], **kwargs)
+    elif name == "BSRoformer_7":
+        from mss.models.bsroformer_7 import BSRoformer
+        model = BSRoformer(**configs["model"], **kwargs)
+    elif name == "BSRoformer_04a4":
+        from mss.models.bsroformer04a4 import BSRoformerMagPhase5
+        model = BSRoformerMagPhase5(**configs["model"], **kwargs)
     elif name == "MMTransformer1D":
         from mss.models.mmtransformer1d import BSRoformer
         model = BSRoformer(**configs["model"], **kwargs)
     elif name == "MMTransformer1D_1":
         from mss.models.mmtransformer1d_1 import BSRoformer
         model = BSRoformer(**configs["model"], **kwargs)
+    elif name == "MMTransformer1D_1a":
+        from mss.models.mmtransformer1d_1a import BSRoformer
+        model = BSRoformer(**configs["model"], **kwargs)
+    elif name == "MMTransformer1D_1b":
+        from mss.models.mmtransformer1d_1b import BSRoformer
+        model = BSRoformer(**configs["model"], **kwargs)
+    elif name == "MMTransformer1D_1c":
+        from mss.models.mmtransformer1d_1c import BSRoformer
+        model = BSRoformer(**configs["model"], **kwargs)
+    elif name == "MMTransformer1D_2_":
+        from mss.models.mmtransformer1d_2_ import BSRoformer
+        model = BSRoformer(**configs["model"], **kwargs)
     elif name == "MMTransformer1D_2":
         from mss.models.mmtransformer1d_2 import BSRoformer
+        model = BSRoformer(**configs["model"], **kwargs)
+    elif name == "MMTransformer1D_3":
+        from mss.models.mmtransformer1d_3 import BSRoformer
+        model = BSRoformer(**configs["model"], **kwargs)
+    elif name == "MMTransformer1D_4":
+        from mss.models.mmtransformer1d_4 import BSRoformer
+        model = BSRoformer(**configs["model"], **kwargs)
+    elif name == "MMTransformer1D_5":
+        from mss.models.mmtransformer1d_5 import BSRoformer
+        model = BSRoformer(**configs["model"], **kwargs)
+    elif name == "MMTransformer1D_6":
+        from mss.models.mmtransformer1d_6 import BSRoformer
+        model = BSRoformer(**configs["model"], **kwargs)
+    elif name == "MMTransformer1D_7":
+        from mss.models.mmtransformer1d_7 import BSRoformer
+        model = BSRoformer(**configs["model"], **kwargs)
+    elif name == "MMBSRoformer":
+        from mss.models.mmbsroformer import BSRoformer
         model = BSRoformer(**configs["model"], **kwargs)
     else:
         raise ValueError(name)    
@@ -319,6 +391,21 @@ def validate(
         sdrs.append(sdr)
 
     return np.nanmedian(sdrs)
+
+def count_params(model: nn.Module) -> int:
+    r"""Count the number of parameters of a model."""
+
+    num_param = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    
+    if num_param >= 1e6:
+        ret = f"{num_param / 1e6:.2f}M"
+    elif num_param >= 1e3:
+        ret = f"{num_param / 1e3:.2f}K"
+    elif num_param >= 1e9:
+        ret = f"{num_param / 1e9:.2f}B"
+    else:
+        ret = f"{num_param}"
+    return ret
 
 
 if __name__ == "__main__":

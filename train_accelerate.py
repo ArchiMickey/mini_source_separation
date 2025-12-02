@@ -14,7 +14,7 @@ from tqdm import tqdm
 import wandb
 # import trackio as wandb
 from mss.utils import parse_yaml, requires_grad, update_ema
-from train import get_dataset, get_model, get_optimizer_and_scheduler, get_sampler, validate
+from train import get_dataset, get_model, get_optimizer_and_scheduler, get_sampler, validate, count_params
 from mss.losses import get_loss_fn
 
 
@@ -72,6 +72,7 @@ def train(args) -> None:
     
     accelerator = Accelerator(
         log_with="wandb" if wandb_log else None,
+        # log_with="trackio" if wandb_log else None,
         mixed_precision=precision, 
         kwargs_handlers=[process_group_kwargs],
         step_scheduler_with_optimizer=False
@@ -79,6 +80,7 @@ def train(args) -> None:
     
     if accelerator.is_main_process:
         print(f"Mixed precision: {precision}")
+        print(f"Number of model parameters: {count_params(model)}")
     
     # EMA
     if accelerator.is_main_process:
@@ -96,7 +98,8 @@ def train(args) -> None:
         accelerator.init_trackers(
             project_name="mss",
             init_kwargs={
-                "wandb": {"name": configs.get("name", filename)}
+                "wandb": {"name": configs.get("name", config_name)},
+                "trackio": {"name": configs.get("name", config_name)},
             },
             config=configs,
         )

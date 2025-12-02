@@ -1,0 +1,236 @@
+from __future__ import annotations
+from functools import partial
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from einops import rearrange, pack, unpack
+from torch import Tensor
+from torch.nn.attention.flex_attention import create_block_mask, create_mask
+
+from mss.models.attention import Block
+from mss.models.flex_attention import Block as FlexBlock
+from mss.models.bandsplit import BandSplit
+from mss.models.fourier import Fourier
+from mss.models.rope import RoPE
+
+
+def build_2d_time_window_mask(
+    T: int,
+    F: int,
+    window_size: tuple,
+    device="cpu",
+    dtype=torch.bool
+):
+    """
+    window_size = (left, right)
+
+    left  >= 0: how many time steps BACKWARD (t < t_self)
+    right >= 0: how many time steps FORWARD  (t > t_self)
+
+    -1 means unbounded in that direction.
+
+    True  = allowed to attend
+    False = masked
+    """
+
+    left, right = window_size
+
+    t_self = torch.arange(T, device=device).repeat_interleave(F) # (N,)
+    t      = torch.arange(T, device=device).repeat_interleave(F) # (N,)
+
+    t_self = t_self.unsqueeze(1) # (N,1)
+    t      = t.unsqueeze(0)      # (1,N)
+
+    dt = t - t_self              # positive = future, negative = past
+
+    # Left (past)
+    if left == -1:
+        past_ok = torch.ones_like(dt, dtype=torch.bool)
+    else:
+        past_ok = (dt >= -left)
+
+    # Right (future)
+    if right == -1:
+        future_ok = torch.ones_like(dt, dtype=torch.bool)
+    else:
+        future_ok = (dt <= right)
+
+    allowed = past_ok & future_ok
+
+    return allowed.to(dtype)
+
+def generate_mask_mod(mask):
+    def mask_mod(b, h, q_idx, kv_idx):
+        return mask[q_idx, kv_idx]
+    return mask_mod
+
+class BSRoformer(Fourier):
+    def __init__(
+        self,
+        audio_channels=2,
+        sample_rate=48000,
+        n_fft=2048,
+        hop_length=480,
+        n_bands=256,
+        band_dim=64,
+        patch_size=[4, 4],
+        dim=768,
+        n_layers=12,
+        n_heads=12,
+        rope_len=8192,
+        window_size=(5, 4),
+        num_registers=8,
+        use_flex_attention=False,
+        **kwargs
+    ) -> None:
+
+        super().__init__(
+            n_fft=n_fft, 
+            hop_length=hop_length, 
+            return_complex=True, 
+            normalized=True
+        )
+
+        self.patch_size = patch_size
+        self.window_size = window_size
+        self.use_flex_attention = use_flex_attention
+        self.num_registers = num_registers
+
+        # Band split
+        self.bandsplit = BandSplit(
+            sr=sample_rate, 
+            n_fft=n_fft, 
+            n_bands=n_bands,
+            in_channels=audio_channels * 2,  # real + imag
+            out_channels=band_dim
+        )
+
+        self.patch = nn.Conv2d(band_dim, dim, kernel_size=patch_size, stride=patch_size)
+        self.unpatch = nn.ConvTranspose2d(dim, band_dim, kernel_size=patch_size, stride=patch_size)
+
+        # RoPE
+        self.rope = RoPE(head_dim=dim // n_heads // 2, max_len=rope_len)
+
+        # Transformer blocks
+        block_cls = FlexBlock if use_flex_attention else Block
+        self.blocks = nn.ModuleList(block_cls(dim, n_heads) for _ in range(n_layers))
+        
+        self.registers = nn.Parameter(torch.randn(num_registers, dim))
+        
+        self.attn_mask_cache = None
+
+    def forward(self, audio: Tensor) -> Tensor:
+        r"""Separation model.
+
+        b: batch_size
+        c: channels_num
+        l: audio_samples
+        t: frames_num
+        f: freq_bins
+
+        Args:
+            audio: (b, c, t)
+
+        Outputs:
+            output: (b, c, t)
+        """
+
+        # --- 1. Encode ---
+        # 1.1 Complex spectrum
+        complex_sp = self.stft(audio)  # shape: (b, c, t, f)
+
+        x = torch.view_as_real(complex_sp)  # shape: (b, c, t, f, 2)
+        x = rearrange(x, 'b c t f k -> b (c k) t f')  # shape: (b, d, t, f)
+        T0 = x.shape[2]
+
+        # 1.2 Pad stft
+        x = self.pad_tensor(x)  # x: (b, d, t, f)
+
+        # 1.3 Convert STFT to mel scale
+        x = self.bandsplit.transform(x)  # shape: (b, d, t, f)
+
+        # 1.4 Patchify
+        x = self.patch(x)  # shape: (b, d, t, f)
+        T1 = x.shape[2]
+
+        L = x.shape[2] * x.shape[3] + self.num_registers
+        # --- 2. Transformer ---
+        if self.window_size != (-1, -1):
+            if self.attn_mask_cache is not None and self.attn_mask_cache.shape[2:] == (L, L):
+                attn_mask = self.attn_mask_cache
+            else:
+                mask = build_2d_time_window_mask(
+                    T=x.shape[2],
+                    F=x.shape[3],
+                    window_size=self.window_size,
+                    device=x.device,
+                )
+                mask = F.pad(mask, (self.num_registers, 0, self.num_registers, 0), value=True)
+                if self.use_flex_attention:
+                    attn_mask = create_block_mask(generate_mask_mod(mask), None, None, L, L, x.device)
+                else:
+                    attn_mask = create_mask(generate_mask_mod(mask), None, None, L, L, x.device)
+                self.attn_mask_cache = attn_mask
+        else:
+            attn_mask = None
+        
+        pos = self.get_pos(x)  # shape: (T*F, 2)
+        x = rearrange(x, 'b d t f -> b (t f) d')
+        r = rearrange(self.registers, 'n d -> 1 n d').expand(x.shape[0], -1, -1)
+        x, ps = pack([r, x], 'b * d')
+        
+        for block in self.blocks:
+            x = block(x, rope=self.rope, pos=pos, attn_mask=attn_mask)  # shape: (b, t * f, d)
+
+        r, x = unpack(x, ps, 'b * d')
+        x = rearrange(x, 'b (t f) d -> b d t f', t=T1)  # shape: (b, d, t, f)
+
+        # --- 3. Decode ---
+        # 3.1 Unpatchify
+        x = self.unpatch(x)  # shape: (b, d, t, f)
+
+        # 3.2 Convert mel scale STFT to original STFT
+        x = self.bandsplit.inverse_transform(x)  # shape: (b, d, t, f)
+
+        # Unpad
+        x = x[:, :, 0 : T0, :]
+        
+        # 3.3 Get complex mask
+        x = rearrange(x, 'b (c k) t f -> b c t f k', k=2).contiguous()
+        mask = torch.view_as_complex(x)  # shape: (b, c, t, f)
+
+        # 3.5 Calculate stft of separated audio
+        sep_stft = mask * complex_sp  # shape: (b, c, t, f)
+
+        # 3.6 ISTFT
+        output = self.istft(sep_stft)  # shape: (b, c, l)
+
+        return output
+
+    def pad_tensor(self, x: Tensor) -> tuple[Tensor, int]:
+        r"""Pad a spectrum that can be evenly divided by downsample_ratio.
+
+        Args:
+            x: E.g., (b, c, t=201, f)
+        
+        Outpus:
+            output: E.g., (b, c, t=204, f)
+        """
+
+        # Pad last frames, e.g., 201 -> 204
+        pad_t = -x.shape[2] % self.patch_size[0]  # Equals to p - (T % p)
+        x = F.pad(x, pad=(0, 0, 0, pad_t))
+
+        return x
+    
+    def get_pos(self, x) -> Tensor:
+        T, F = x.shape[2], x.shape[3]
+        prefix_t = torch.arange(self.num_registers, device=x.device).view(-1, 1).repeat(1, 2)
+        t = torch.arange(T, device=x.device) + self.num_registers
+        f = torch.arange(F, device=x.device)
+        tt, ff = torch.meshgrid(t, f, indexing='ij')  # shape: (T, F)
+        coords = torch.stack([tt, ff], dim=-1).view(-1, 2)
+        coords = torch.cat([prefix_t, coords], dim=0)
+        # print(coords)  # --- IGNORE ---
+        return coords

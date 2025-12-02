@@ -8,7 +8,7 @@ train_datasets:
     MUSDB18HQ:
         root: "/datasets/musdb18hq"
         split: "train"
-        time_align: "strict"  # "strict" | "group"
+        time_align: "group"  # "strict" | "group"
 
 test_datasets:
     MUSDB18HQ:
@@ -18,7 +18,7 @@ test_datasets:
 sampler: RandomSongSampler
 
 model:
-    name: BSRoformer
+    name: MMBSRoformer
     audio_channels: *audio_channels
     sample_rate: *sample_rate
     n_fft: 2048 
@@ -26,9 +26,11 @@ model:
     n_bands: 256
     band_dim: 64
     patch_size: [4, 4]
-    n_layers: 12
+    strides: [1]
+    n_layers: [24]
     n_heads: 12
     dim: 384
+    use_flex_attention: True
 
 train:
     num_workers: 32

@@ -8,7 +8,7 @@ train_datasets:
     MUSDB18HQ:
         root: "/datasets/musdb18hq"
         split: "train"
-        time_align: "strict"  # "strict" | "group"
+        time_align: "group"  # "strict" | "group"
 
 test_datasets:
     MUSDB18HQ:

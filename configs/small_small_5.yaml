@@ -8,7 +8,7 @@ train_datasets:
     MUSDB18HQ:
         root: "/datasets/musdb18hq"
         split: "train"
-        time_align: "strict"  # "strict" | "group"
+        time_align: "group"  # "strict" | "group"
 
 test_datasets:
     MUSDB18HQ:
@@ -26,7 +26,7 @@ model:
     n_bands: 256
     band_dim: 64
     patch_size: [4, 4]
-    n_layers: 12
+    n_layers: 6
     n_heads: 12
     dim: 384
 
