@@ -1,0 +1,18 @@
+[project]
+name = "mini-source-separation"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "accelerate==1.11.0",
+    "librosa==0.11.0",
+    "torch==2.9.1",
+    "einops==0.8.1",
+    "museval==0.4.1",
+    "tqdm==4.67.1",
+    "wandb==0.23.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["mss"]

@@ -225,8 +225,7 @@ class BSRoformer(Fourier):
 
         self.pre_blocks = nn.ModuleList([BSRoformerBlock(dim_sp, dim_sp // dim_head, axis='tf', use_time_mix=True, kernel_size=kernel_size) for _ in range(n_pre_layers)])
         self.post_blocks = nn.ModuleList([BSRoformerBlock(dim_sp, dim_sp // dim_head, axis='tf', use_time_mix=True, kernel_size=kernel_size) for _ in range(n_post_layers)])
-        patch_kernel_size = (kernel_size - 1) // patch_size[0] + 1
-        self.blocks = nn.ModuleList([BSRoformerBlock(dim, dim // dim_head, axis='tf', use_time_mix=True, kernel_size=patch_kernel_size) for _ in range(n_layers)])
+        self.blocks = nn.ModuleList([BSRoformerBlock(dim, dim // dim_head, axis='tf', use_time_mix=True, kernel_size=kernel_size) for _ in range(n_layers)])
 
     def forward(self, audio: Tensor) -> Tensor:
         """
