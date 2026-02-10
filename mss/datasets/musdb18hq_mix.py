@@ -92,7 +92,7 @@ class MUSDB18HQIntraMix(Dataset):
         self.ac = 2  # audio channels
 
         if not Path(self.root).exists():
-            raise Exception(f"{self.root} does not exist. Please download the dataset from {MUSDB18HQ.URL}")
+            raise Exception(f"{self.root} does not exist. Please download the dataset from {MUSDB18HQIntraMix.URL}")
 
         self.audios_dir = Path(self.root, self.split)
         self.list_names = sorted(os.listdir(self.audios_dir))
