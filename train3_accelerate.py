@@ -21,7 +21,7 @@ multiprocessing.set_start_method('spawn', force=True)
 import wandb
 # import trackio as wandb
 from mss.utils import (parse_yaml, requires_grad, update_ema, LinearWarmUp, 
-    separate_overlap_add, calculate_sdr)
+    LinearWarmUpLinearDecay, LinearWarmUpConstantCosine, separate_overlap_add, calculate_sdr)
 
 
 def count_params(model: nn.Module) -> str:
@@ -56,8 +56,14 @@ def train(args) -> None:
     process_group_kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=7200))
     from accelerate import DistributedDataParallelKwargs
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    
+    # Gradient accumulation steps from config (default to 1 if not specified)
+    gradient_accumulation_steps = configs["train"].get("gradient_accumulation_steps", 1)
+    print(f"Gradient accumulation steps: {gradient_accumulation_steps}")
+    
     accelerator = Accelerator(
         mixed_precision=precision, 
+        gradient_accumulation_steps=gradient_accumulation_steps,
         kwargs_handlers=[process_group_kwargs, ddp_kwargs]
     )
 
@@ -114,8 +120,10 @@ def train(args) -> None:
     # aa = AA(stems=train_dataset.stems)
 
     # Train
+    # Use update_step to track optimizer steps (not batches)
+    update_step = 0
     pbar = tqdm(train_dataloader, disable=not accelerator.is_main_process)
-    for step, data in enumerate(pbar):
+    for batch_step, data in enumerate(pbar):
         # ------ 1. Training ------
         # 1.1 Data
         target = data["target"]
@@ -125,75 +133,81 @@ def train(args) -> None:
         model.train()
         output = model(mixture)
 
-        # 1.2 Loss
+        # 1.2 Loss - scale loss for gradient accumulation
         loss = loss_fn(output=output, target=target)
+        loss = loss / gradient_accumulation_steps
         
-        # 1.3 Optimize
-        optimizer.zero_grad()  # Reset all parameter.grad to 0
-        accelerator.backward(loss)  # Update all parameter.grad
+        # 1.3 Optimize with gradient accumulation
+        accelerator.backward(loss)
         
-        log_info = {"loss": loss.item(), "lr": scheduler.get_last_lr()[0]}
-        
-        # Gradient clipping
-        max_grad_norm = configs["train"].get("max_grad_norm", None)
-        if max_grad_norm is not None:
-            grad_norm = accelerator.clip_grad_norm_(model.parameters(), max_grad_norm)
-            pbar.set_postfix(grad_norm=grad_norm.item())
-            log_info["grad_norm"] = grad_norm.item()
-        
-        optimizer.step()  # Update all parameters based on all parameter.grad
-        scheduler.step()
-        if accelerator.is_main_process:
-            update_ema(ema, model, decay=0.999)
-
-        # if step % 100 == 0:
-            # print(loss)
-        pbar.set_description(f"Step {step}, Loss: {loss.item():.4f}, LR: {scheduler.get_last_lr()[0]:.6f}")
-        if wandb_log and accelerator.is_main_process:
-            wandb.log(log_info, step=step)
-        
-        # ------ 2. Evaluation ------
-        # 2.1 Evaluate
-        if step % configs["train"]["test_every_n_steps"] == 0:
+        # Only update weights when gradients are synchronized
+        if accelerator.sync_gradients:
+            log_info = {"loss": loss.item() * gradient_accumulation_steps, "lr": scheduler.get_last_lr()[0]}
+            
+            # Gradient clipping
+            max_grad_norm = configs["train"].get("max_grad_norm", None)
+            if max_grad_norm is not None:
+                grad_norm = accelerator.clip_grad_norm_(model.parameters(), max_grad_norm)
+                pbar.set_postfix(grad_norm=grad_norm.item())
+                log_info["grad_norm"] = grad_norm.item()
+            
+            optimizer.step()  # Update all parameters based on all parameter.grad
+            optimizer.zero_grad()  # Reset all parameter.grad to 0
+            scheduler.step()
             if accelerator.is_main_process:
-                train_sdr = validate(
-                    configs=configs,
-                    model=accelerator.unwrap_model(ema),
-                    split="train",
-                    audios_num=valid_num,
-                )
-
-                test_sdr = validate(
-                    configs=configs,
-                    model=accelerator.unwrap_model(ema),
-                    split="test",
-                    audios_num=valid_num,
-                )
-
-                if wandb_log:
-                    wandb.log(
-                        data={
-                            "train_sdr": train_sdr, 
-                            "test_sdr": test_sdr,
-                        },
-                        step=step
+                update_ema(ema, model, decay=0.999)
+            
+            # Update tqdm only when optimizer is stepped
+            pbar.set_description(f"Step {update_step}, Loss: {loss.item() * gradient_accumulation_steps:.4f}, LR: {scheduler.get_last_lr()[0]:.6f}")
+            pbar.update(1)
+            
+            if wandb_log and accelerator.is_main_process:
+                wandb.log(log_info, step=update_step)
+            
+            # ------ 2. Evaluation ------
+            # 2.1 Evaluate
+            if update_step % configs["train"]["test_every_n_steps"] == 0:
+                if accelerator.is_main_process:
+                    train_sdr = validate(
+                        configs=configs,
+                        model=accelerator.unwrap_model(ema),
+                        split="train",
+                        audios_num=valid_num,
                     )
 
-                print("====== Overall metrics ====== ")
-                print(f"Train SDR: {train_sdr:.2f} dB")
-                print(f"Test SDR: {test_sdr:.2f} dB")
-            accelerator.wait_for_everyone()
-        
-        # 2.2 Save model
-        if step % configs["train"]["save_every_n_steps"] == 0:
-            if accelerator.is_main_process:
-                ckpt_path = Path(ckpts_dir, f"step={step}_ema.pth")
-                torch.save(accelerator.unwrap_model(ema).state_dict(), ckpt_path)
-                print("Save model to {}".format(ckpt_path))
-            accelerator.wait_for_everyone()
+                    test_sdr = validate(
+                        configs=configs,
+                        model=accelerator.unwrap_model(ema),
+                        split="test",
+                        audios_num=valid_num,
+                    )
 
-        if step == configs["train"]["training_steps"]:
-            break
+                    if wandb_log:
+                        wandb.log(
+                            data={
+                                "train_sdr": train_sdr, 
+                                "test_sdr": test_sdr,
+                            },
+                            step=update_step
+                        )
+
+                    print("====== Overall metrics ====== ")
+                    print(f"Train SDR: {train_sdr:.2f} dB")
+                    print(f"Test SDR: {test_sdr:.2f} dB")
+                accelerator.wait_for_everyone()
+            
+            # 2.2 Save model
+            if update_step % configs["train"]["save_every_n_steps"] == 0:
+                if accelerator.is_main_process:
+                    ckpt_path = Path(ckpts_dir, f"step={update_step}_ema.pth")
+                    torch.save(accelerator.unwrap_model(ema).state_dict(), ckpt_path)
+                    print("Save model to {}".format(ckpt_path))
+                accelerator.wait_for_everyone()
+
+            if update_step == configs["train"]["training_steps"]:
+                break
+            
+            update_step += 1
 
 
 # from mss.augmentations.torch.gain import RandomGain
@@ -394,13 +408,22 @@ def get_optimizer_and_scheduler(
 
     lr = float(configs["train"]["lr"])
     warm_up_steps = configs["train"]["warm_up_steps"]
+    training_steps = configs["train"]["training_steps"]
     optimizer_name = configs["train"]["optimizer"]
 
     if optimizer_name == "AdamW":
         optimizer = optim.AdamW(params=params, lr=lr)
 
     if warm_up_steps:
-        lr_lambda = LinearWarmUp(warm_up_steps)
+        min_lr = configs["train"].get("min_lr", 1e-6)
+        # Use LinearWarmUpConstantCosine scheduler with 1000 warmup steps,
+        # 70% constant phase, and 30% cosine annealing
+        lr_lambda = LinearWarmUpConstantCosine(
+            warm_up_steps=warm_up_steps,
+            total_steps=training_steps,
+            constant_ratio=0.7,
+            min_lr=min_lr
+        )
         scheduler = optim.lr_scheduler.LambdaLR(optimizer=optimizer, lr_lambda=lr_lambda)
     else:
         scheduler = None
