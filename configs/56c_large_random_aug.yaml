@@ -45,7 +45,7 @@ test_datasets:
 sampler: RandomSongSamplerMix
 
 model:
-    name: BSRoformer56b
+    name: BSRoformer56c
     audio_channels: *audio_channels
     sample_rate: *sample_rate
     n_fft: 2048 
@@ -59,6 +59,7 @@ model:
     n_layers: 12
     n_pre_layers: 1
     n_post_layers: 1
+    kernel_size: 7
 
 train:
     device: cuda
