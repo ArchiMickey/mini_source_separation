@@ -121,9 +121,10 @@ def train(args) -> None:
 
     # Train
     # Use update_step to track optimizer steps (not batches)
+    training_steps = configs["train"]["training_steps"]
     update_step = 0
-    pbar = tqdm(train_dataloader, disable=not accelerator.is_main_process)
-    for batch_step, data in enumerate(pbar):
+    pbar = tqdm(total=training_steps, disable=not accelerator.is_main_process)
+    for batch_step, data in enumerate(train_dataloader):
         # ------ 1. Training ------
         # 1.1 Data
         target = data["target"]
@@ -204,10 +205,11 @@ def train(args) -> None:
                     print("Save model to {}".format(ckpt_path))
                 accelerator.wait_for_everyone()
 
-            if update_step == configs["train"]["training_steps"]:
-                break
-            
             update_step += 1
+            if update_step == training_steps:
+                break
+
+    pbar.close()
 
 
 # from mss.augmentations.torch.gain import RandomGain

@@ -56,6 +56,78 @@ class LinearWarmUp:
             return 1.
 
 
+class LinearWarmUpLinearDecay:
+    r"""Linear learning rate warm up and linear decay scheduler.
+    """
+
+    def __init__(self, warm_up_steps: int, total_steps: int, min_lr: float = 1e-6) -> None:
+        self.warm_up_steps = warm_up_steps
+        self.total_steps = total_steps
+        self.min_lr = min_lr
+
+    def __call__(self, step: int) -> float:
+        if step <= self.warm_up_steps:
+            return step / self.warm_up_steps
+        elif step <= self.total_steps:
+            return self.min_lr + (1. - self.min_lr) * (1. - (step - self.warm_up_steps) / (self.total_steps - self.warm_up_steps))
+        else:
+            return self.min_lr
+
+
+class LinearWarmUpConstantCosine:
+    r"""Linear warmup, constant LR, then cosine annealing scheduler.
+    
+    The schedule consists of three phases:
+    1. Linear warmup: LR increases linearly from 0 to 1 over warm_up_steps
+    2. Constant phase: LR stays at 1 for constant_ratio of remaining steps
+    3. Cosine annealing: LR decays from 1 to min_lr using cosine curve
+    
+    Args:
+        warm_up_steps (int): Number of steps for linear warmup
+        total_steps (int): Total training steps
+        constant_ratio (float): Ratio of post-warmup steps to keep constant (default 0.7)
+        min_lr (float): Minimum learning rate ratio at end of cosine annealing (default 1e-6)
+    """
+
+    def __init__(
+        self, 
+        warm_up_steps: int, 
+        total_steps: int, 
+        constant_ratio: float = 0.7, 
+        min_lr: float = 1e-6
+    ) -> None:
+        self.warm_up_steps = warm_up_steps
+        self.total_steps = total_steps
+        self.constant_ratio = constant_ratio
+        self.min_lr = min_lr
+        
+        # Calculate phase boundaries
+        self.post_warmup_steps = total_steps - warm_up_steps
+        self.constant_steps = int(self.post_warmup_steps * constant_ratio)
+        self.cosine_start_step = warm_up_steps + self.constant_steps
+        self.cosine_steps = self.post_warmup_steps - self.constant_steps
+
+    def __call__(self, step: int) -> float:
+        # Phase 1: Linear warmup
+        if step < self.warm_up_steps:
+            return step / self.warm_up_steps
+        
+        # Phase 2: Constant LR
+        elif step < self.cosine_start_step:
+            return 1.0
+        
+        # Phase 3: Cosine annealing
+        elif step < self.total_steps:
+            # Progress through cosine phase (0 to 1)
+            cosine_progress = (step - self.cosine_start_step) / self.cosine_steps
+            # Cosine decay from 1 to min_lr
+            return self.min_lr + (1.0 - self.min_lr) * 0.5 * (1.0 + math.cos(math.pi * cosine_progress))
+        
+        # After total_steps: return min_lr
+        else:
+            return self.min_lr
+
+
 def separate_overlap_add(
     model: nn.Module, 
     audio: Tensor, 

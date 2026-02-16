@@ -104,7 +104,7 @@ class GRN(nn.Module):
         return self.gamma * (x * Nx) + self.beta + x
 
 class TimeMixBlock(nn.Module):
-    def __init__(self, dim, kernel_size=7, dim_mult=4):
+    def __init__(self, dim, kernel_size=7, dim_mult=6):
         super().__init__()
         hidden_dim = int(dim * dim_mult * 2 // 3)
         padding = kernel_size // 2
