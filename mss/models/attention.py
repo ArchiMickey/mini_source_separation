@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Literal
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -7,6 +9,13 @@ from einops import rearrange
 from torch import LongTensor, Tensor
 
 from mss.models.rope import RoPE
+
+# Optional flash_attn import
+try:
+    from flash_attn import flash_attn_func
+    FLASH_ATTN_AVAILABLE = True
+except ImportError:
+    FLASH_ATTN_AVAILABLE = False
 
 
 class AbsolutePositionEmbedding(nn.Module):
@@ -125,6 +134,8 @@ class Block(nn.Module):
         num_heads: int,
         position_embedding_type: str = "rope",
         max_seq_len: int = 8192,
+        attn_backend: Literal["torch", "flash_attn"] = "torch",
+        window_size: int | None = None,
     ) -> None:
         super().__init__()
 
@@ -136,6 +147,8 @@ class Block(nn.Module):
             num_heads,
             position_embedding_type=position_embedding_type,
             max_seq_len=max_seq_len,
+            attn_backend=attn_backend,
+            window_size=window_size,
         )
         
         self.ffn = nn.Sequential(
@@ -174,6 +187,8 @@ class BlockV2(nn.Module):
         num_heads: int,
         position_embedding_type: str = "rope",
         max_seq_len: int = 8192,
+        attn_backend: Literal["torch", "flash_attn"] = "torch",
+        window_size: int | None = None,
     ) -> None:
         super().__init__()
 
@@ -185,6 +200,8 @@ class BlockV2(nn.Module):
             num_heads,
             position_embedding_type=position_embedding_type,
             max_seq_len=max_seq_len,
+            attn_backend=attn_backend,
+            window_size=window_size,
         )
         
         self.ffn = GatedMLP(dim, intermediate_dim=dim * 4)
@@ -240,7 +257,7 @@ class RMSNorm(nn.Module):
 
 
 class SelfAttention(nn.Module):
-    r"""Self-Attention module with configurable position embedding.
+    r"""Self-Attention module with configurable position embedding and attention backend.
     
     This module supports two types of position embeddings:
     
@@ -256,11 +273,21 @@ class SelfAttention(nn.Module):
        - Requires specifying max_seq_len
        - Can be more efficient computationally
     
+    This module also supports two attention backends:
+    
+    1. torch - Uses PyTorch's scaled_dot_product_attention
+       - Supports windowed attention via attention mask
+       
+    2. flash_attn - Uses flash_attn library for efficient attention
+       - Supports windowed attention via window_size argument
+    
     Args:
         dim: Model dimension
         num_heads: Number of attention heads
         position_embedding_type: Type of position embedding ("rope" or "absolute")
         max_seq_len: Maximum sequence length (required for absolute embeddings)
+        attn_backend: Attention backend ("torch" or "flash_attn")
+        window_size: Window size for local attention (None for global attention)
     """
     
     def __init__(
@@ -269,6 +296,8 @@ class SelfAttention(nn.Module):
         num_heads: int,
         position_embedding_type: str = "rope",
         max_seq_len: int = 8192,
+        attn_backend: Literal["torch", "flash_attn"] = "torch",
+        window_size: int | None = None,
     ) -> None:
         super().__init__()
         
@@ -276,6 +305,24 @@ class SelfAttention(nn.Module):
         self.head_dim = dim // num_heads
         self.num_heads = num_heads
         self.dim = dim
+        self.window_size = window_size
+        
+        # Validate attention backend
+        valid_backends = ["torch", "flash_attn"]
+        if attn_backend not in valid_backends:
+            raise ValueError(
+                f"Invalid attn_backend: '{attn_backend}'. "
+                f"Must be one of {valid_backends}"
+            )
+        
+        # Check flash_attn availability
+        if attn_backend == "flash_attn" and not FLASH_ATTN_AVAILABLE:
+            raise ImportError(
+                "flash_attn backend requested but flash_attn is not installed. "
+                "Please install it with: pip install flash-attn --no-build-isolation"
+            )
+        
+        self.attn_backend = attn_backend
         
         # Validate position embedding type
         valid_types = ["rope", "absolute"]
@@ -301,6 +348,31 @@ class SelfAttention(nn.Module):
         self.norm_k = RMSNorm(dim)
 
         self.proj = nn.Linear(dim, dim)
+    
+    def _create_window_mask(self, seq_len: int, device: torch.device) -> Tensor:
+        r"""Create attention mask for windowed attention.
+        
+        Args:
+            seq_len: Sequence length
+            device: Device to create the mask on
+            
+        Returns:
+            mask: (seq_len, seq_len) - Boolean mask where True indicates positions to attend to
+        """
+        if self.window_size is None:
+            return None
+        
+        # Create a mask where each position can attend to positions within the window
+        # Window is centered on each position
+        positions = torch.arange(seq_len, device=device)
+        
+        # Calculate distance matrix
+        distance = torch.abs(positions.unsqueeze(1) - positions.unsqueeze(0))
+        
+        # Create mask: True for positions within window, False otherwise
+        mask = distance <= self.window_size // 2
+        
+        return mask
 
     def forward(
         self,
@@ -308,7 +380,7 @@ class SelfAttention(nn.Module):
         rope: nn.Module | None = None,
         pos: LongTensor | None = None,
     ) -> Tensor:
-        r"""Self attention with configurable position embedding.
+        r"""Self attention with configurable position embedding and backend.
 
         b: batch_size
         l: seq_len
@@ -355,16 +427,43 @@ class SelfAttention(nn.Module):
                 q = self.pos_embedding.apply_nd(q, pos)  # (b, l, n, h)
                 k = self.pos_embedding.apply_nd(k, pos)  # (b, l, n, h)
 
-        # Efficient attention using Flash Attention CUDA kernels
-        x = F.scaled_dot_product_attention(
-            query=rearrange(q, 'b l n h -> b n l h'), 
-            key=rearrange(k, 'b l n h -> b n l h'), 
-            value=rearrange(v, 'b l n h -> b n l h'), 
-            attn_mask=None, 
-            dropout_p=0.0
-        )  # (b, n, l, h)
+        # Compute attention based on backend
+        if self.attn_backend == "flash_attn":
+            # Use flash_attn for efficient attention
+            # flash_attn_func expects (b, l, n, h) layout and returns (b, l, n, h)
+            if self.window_size is not None:
+                # flash_attn uses (window_left, window_right) for sliding window attention
+                # We use symmetric window: (window_size // 2, window_size // 2)
+                window_size_half = self.window_size // 2
+                window_size_tuple = (window_size_half, window_size_half)
+            else:
+                window_size_tuple = (-1, -1)  # (-1, -1) means global attention
+            
+            x = flash_attn_func(
+                q, k, v,
+                window_size=window_size_tuple,
+            )  # (b, l, n, h)
+            
+        else:
+            # Use PyTorch's scaled_dot_product_attention
+            # Create attention mask for windowed attention if needed
+            attn_mask = None
+            if self.window_size is not None:
+                attn_mask = self._create_window_mask(x.shape[1], x.device)
+                # scaled_dot_product_attention expects mask where True = masked out
+                # So we need to invert our mask
+                attn_mask = ~attn_mask
+            
+            x = F.scaled_dot_product_attention(
+                query=rearrange(q, 'b l n h -> b n l h'), 
+                key=rearrange(k, 'b l n h -> b n l h'), 
+                value=rearrange(v, 'b l n h -> b n l h'), 
+                attn_mask=attn_mask, 
+                dropout_p=0.0
+            )  # (b, n, l, h)
+            x = rearrange(x, 'b n l h -> b l n h')
 
-        x = rearrange(x, 'b n l h -> b l (n h)')
+        x = rearrange(x, 'b l n h -> b l (n h)')
         x = self.proj(x)  # (b, l, d)
         
         return x

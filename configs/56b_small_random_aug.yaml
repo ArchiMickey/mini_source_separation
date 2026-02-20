@@ -1,8 +1,8 @@
 ---
 audio_channels: &audio_channels 2
 sample_rate: &sample_rate 48000
-load_duration: 5.
-segment_duration: 4.
+load_duration: 4.
+segment_duration: 3.
 target_stem: "vocals"
 
 augmentation:
@@ -52,11 +52,11 @@ model:
     hop_length: 480
     n_bands: 256
     band_dim: 64
-    dim: 512
-    dim_sp: 128
+    dim: 384
+    dim_sp: 96
     dim_head: 32
     patch_size: [4, 4]
-    n_layers: 12
+    n_layers: 6
     n_pre_layers: 1
     n_post_layers: 1
 
@@ -70,8 +70,8 @@ train:
     lr: 3e-4
     max_grad_norm: 1.0 # Leave blank if no gradient clipping is used
     warm_up_steps: 1000  # Leave blank if no warm up is used
-    batch_size_per_device: 2
-    gradient_accumulation_steps: 2
+    batch_size_per_device: 4
+    gradient_accumulation_steps: 1
     test_every_n_steps: 20000
     save_every_n_steps: 50000
     training_steps: 1000000

@@ -12,6 +12,7 @@ from mss.io.audio import load
 from mss.io.crops import RandomCrop
 from torch.utils.data import Dataset
 from typing_extensions import Literal
+from tqdm import tqdm
 
 
 class MUSDB18HQIntraMix(Dataset):
@@ -25,24 +26,24 @@ class MUSDB18HQIntraMix(Dataset):
     The dataset looks like:
 
         musdb18hq (30 GB)
-        ├── train (100 files)
-        │   ├── A Classic Education - NightOwl
-        │   │   ├── bass.wav
-        │   │   ├── drums.wav
-        │   │   ├── mixture.wav
-        │   │   ├── other.wav
-        │   │   └── vocals.wav
-        │   ... 
-        │   └── ...
-        └── test (50 files)
-            ├── Al James - Schoolboy Facination
-            │   ├── bass.wav
-            │   ├── drums.wav
-            │   ├── mixture.wav
-            │   ├── other.wav
-            │   └── vocals.wav
+        |-- train (100 files)
+        |   |-- A Classic Education - NightOwl
+        |   |   |-- bass.wav
+        |   |   |-- drums.wav
+        |   |   |-- mixture.wav
+        |   |   |-- other.wav
+        |   |   `-- vocals.wav
+        |   ... 
+        |   `-- ...
+        `-- test (50 files)
+            |-- Al James - Schoolboy Facination
+            |   |-- bass.wav
+            |   |-- drums.wav
+            |   |-- mixture.wav
+            |   |-- other.wav
+            |   `-- vocals.wav
             ... 
-            └── ...
+            `-- ...
     """
 
     URL = "https://zenodo.org/records/3338373"
@@ -63,13 +64,16 @@ class MUSDB18HQIntraMix(Dataset):
         time_align: Literal["strict", "group", "random"] = "group",
         stem_transform: None | callable | list[callable] = None,
         group_transform: None | callable | list[callable] = None,
-        mixture_transform: None | callable | list[callable] = None
+        mixture_transform: None | callable | list[callable] = None,
+        cache_durations: bool = True,
     ) -> None:
         r"""
         time_align: str. "strict" indicates all stems are aligned (from the 
             same song and have the same start time). "group" indictates 
             target stems / background stems are aligned. "random" indicates 
             all stems are from different songs with different start time.
+        cache_durations: bool. If True, pre-cache all audio durations to avoid
+            repeated I/O in __getitem__.
         """
 
         self.stems = ["bass", "drums", "other", "vocals"]
@@ -87,6 +91,7 @@ class MUSDB18HQIntraMix(Dataset):
         self.stem_transform = stem_transform
         self.group_transform = group_transform
         self.mixture_transform = mixture_transform
+        self.cache_durations = cache_durations
 
         self.segment_samples = int(sr * segment_duration)
         self.ac = 2  # audio channels
@@ -97,6 +102,30 @@ class MUSDB18HQIntraMix(Dataset):
         self.audios_dir = Path(self.root, self.split)
         self.list_names = sorted(os.listdir(self.audios_dir))
         self.audios_num = len(self.list_names)
+        
+        # Pre-cache durations to avoid repeated I/O
+        self.durations = {}
+        if self.cache_durations:
+            self._cache_durations()
+    
+    def _cache_durations(self):
+        """Pre-compute and cache all audio durations.
+        
+        This avoids calling librosa.get_duration() in __getitem__, which
+        would read the file header on every iteration.
+        """
+        for name in tqdm(self.list_names, desc="Caching audio durations"):
+            # Use mixture.wav to get duration (all stems have same duration)
+            mixture_path = Path(self.audios_dir, name, "mixture.wav")
+            if mixture_path.exists():
+                self.durations[name] = librosa.get_duration(path=str(mixture_path))
+            else:
+                # Fallback: use any stem file
+                for stem in self.stems:
+                    stem_path = Path(self.audios_dir, name, f"{stem}.wav")
+                    if stem_path.exists():
+                        self.durations[name] = librosa.get_duration(path=str(stem_path))
+                        break
        
     def __getitem__(
         self, 
@@ -118,7 +147,11 @@ class MUSDB18HQIntraMix(Dataset):
                 audio_names[stem].append(name)
                 audio_paths[stem].append(path)
 
-                audio_duration = librosa.get_duration(path=path)
+                # Use cached duration if available, otherwise read from file
+                if name in self.durations:
+                    audio_duration = self.durations[name]
+                else:
+                    audio_duration = librosa.get_duration(path=path)
                 start_time, _ = self.crop(audio_duration=audio_duration)
                 start_times[stem].append(start_time)
 

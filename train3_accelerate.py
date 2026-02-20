@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from datetime import timedelta
 from pathlib import Path
@@ -12,6 +13,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torchaudio
 from accelerate import Accelerator, InitProcessGroupKwargs
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
@@ -71,7 +73,7 @@ def train(args) -> None:
     train_dataset = get_dataset(configs, split="train")
 
     # Sampler
-    train_sampler = get_sampler(configs, train_dataset)
+    train_sampler = get_sampler(configs, train_dataset, accelerator)
 
     # Dataloader
     train_dataloader = DataLoader(
@@ -79,7 +81,9 @@ def train(args) -> None:
         batch_size=configs["train"]["batch_size_per_device"], 
         sampler=train_sampler,
         num_workers=configs["train"]["num_workers"], 
-        pin_memory=True
+        pin_memory=True,
+        persistent_workers=True if configs["train"]["num_workers"] > 0 else False,
+        prefetch_factor=4 if configs["train"]["num_workers"] > 0 else None,
     )
 
     # Model
@@ -123,7 +127,13 @@ def train(args) -> None:
     # Use update_step to track optimizer steps (not batches)
     training_steps = configs["train"]["training_steps"]
     update_step = 0
+    epoch = 0
     pbar = tqdm(total=training_steps, disable=not accelerator.is_main_process)
+    
+    # Set epoch for sampler (important for DDP)
+    if hasattr(train_sampler, 'set_epoch'):
+        train_sampler.set_epoch(epoch)
+
     for batch_step, data in enumerate(train_dataloader):
         # ------ 1. Training ------
         # 1.1 Data
@@ -286,22 +296,26 @@ def get_dataset(
             raise ValueError(name)
             
 
-def get_sampler(configs: dict, dataset: Dataset) -> Iterable:
+def get_sampler(configs: dict, dataset: Dataset, accelerator):
     r"""Get sampler."""
 
     name = configs["sampler"]
 
+    # Set num_replicas and rank for DDP
+    num_replicas = None if accelerator.num_processes < 1 else accelerator.num_processes
+    rank = None if accelerator.num_processes < 1 else accelerator.process_index
+
     if name == "RandomSongSampler":
         from mss.samplers.random_song_sampler import RandomSongSampler
-        return RandomSongSampler(dataset)
+        return RandomSongSampler(dataset, num_replicas=num_replicas, rank=rank)
 
     elif name == "RandomSongSampler_multi":
         from mss.samplers.random_song_sampler_multi import RandomSongSampler_multi
-        return RandomSongSampler_multi(dataset)
+        return RandomSongSampler_multi(dataset, num_replicas=num_replicas, rank=rank)
 
     elif name == "RandomSongSamplerMix":
         from mss.samplers.random_song_sampler_mix import RandomSongSamplerMix
-        return RandomSongSamplerMix(dataset, configs["augmentation"]["cpu"]["mixing"]["intra_source"]["max_sources"])
+        return RandomSongSamplerMix(dataset, configs["augmentation"]["cpu"]["mixing"]["intra_source"]["max_sources"], num_replicas=num_replicas, rank=rank)
 
     else:
         raise ValueError(name)
@@ -374,6 +388,9 @@ def get_model(
     elif name == "BSRoformer56d":
         from mss.models.bsroformer56d import BSRoformer
         model = BSRoformer(**configs["model"])
+    elif name == "BSRoformer57c":
+        from mss.models.bsroformer57c import BSRoformer
+        model = BSRoformer(**configs["model"])
 
     else:
         raise ValueError(name)    
@@ -431,7 +448,48 @@ def get_optimizer_and_scheduler(
         scheduler = None
 
     return optimizer, scheduler
-        
+
+
+def _load_audio_torchaudio(audio_path: Path, sr: int) -> np.ndarray:
+    r"""Load audio using torchaudio (faster than librosa).
+    
+    Returns:
+        audio: (c, L) numpy array
+    """
+    waveform, orig_sr = torchaudio.load(audio_path)  # (c, L)
+    if orig_sr != sr:
+        resampler = torchaudio.transforms.Resample(orig_sr, sr)
+        waveform = resampler(waveform)
+    return waveform.numpy()
+
+
+def _load_song_data(
+    audios_dir: Path, 
+    audio_name: str, 
+    stems: list[str], 
+    sr: int
+) -> dict[str, np.ndarray]:
+    r"""Load all stems for a single song in parallel.
+    
+    Returns:
+        data: dict mapping stem name to audio array (c, L)
+    """
+    data = {}
+    
+    def load_stem(stem: str) -> tuple[str, np.ndarray]:
+        audio_path = Path(audios_dir, audio_name, f"{stem}.wav")
+        audio = _load_audio_torchaudio(audio_path, sr)
+        return stem, audio
+    
+    # Load all 4 stems in parallel using threads
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [executor.submit(load_stem, stem) for stem in stems]
+        for future in futures:
+            stem, audio = future.result()
+            data[stem] = audio
+    
+    return data
+
 
 def validate(
     configs: dict,
@@ -464,18 +522,31 @@ def validate(
         skip_n = 1
     
     stems = ["vocals", "bass", "drums", "other"]
+    
+    # Get indices to evaluate
+    eval_indices = list(range(0, len(audio_names), skip_n))
+    
+    # Pre-load all audio data in parallel
+    def load_single_song(idx: int) -> tuple[int, dict[str, np.ndarray], str]:
+        audio_name = audio_names[idx]
+        data = _load_song_data(audios_dir, audio_name, stems, sr)
+        return idx, data, audio_name
+    
+    # Load all songs in parallel (I/O bound, so threads work well)
+    all_song_data = {}
+    all_audio_names = {}
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(load_single_song, idx) for idx in eval_indices]
+        for future in futures:
+            idx, data, audio_name = future.result()
+            all_song_data[idx] = data
+            all_audio_names[idx] = audio_name
+    
     sdrs = []
 
-    for idx in range(0, len(audio_names), skip_n):
-
-        # Get data
-        audio_name = audio_names[idx]    
-        data = {}
-
-        for stem in stems:
-            audio_path = Path(audios_dir, audio_name, f"{stem}.wav")
-            audio, _ = librosa.load(audio_path, sr=sr, mono=False)  # (c, L)
-            data[stem] = audio
+    for idx in eval_indices:
+        audio_name = all_audio_names[idx]
+        data = all_song_data[idx]
 
         data["mixture"] = np.sum([data[stem] for stem in stems], axis=0)  # (c, L)
 
