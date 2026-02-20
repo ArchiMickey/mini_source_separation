@@ -230,8 +230,8 @@ class BSRoformer(Fourier):
         self.up = nn.ConvTranspose2d(dim, dim_sp, kernel_size=patch_size, stride=patch_size)
         self.fusion = GEGLUFusion(dim_sp)
 
-        self.pre_blocks = nn.ModuleList([BSRoformerBlock(dim_sp, dim_sp // dim_head, axis='tf', use_time_mix=True, kernel_size=kernel_size, n_time_blocks=n_time_blocks, n_freq_blocks=n_freq_blocks) for _ in range(n_pre_layers)])
-        self.post_blocks = nn.ModuleList([BSRoformerBlock(dim_sp, dim_sp // dim_head, axis='tf', use_time_mix=True, kernel_size=kernel_size, n_time_blocks=n_time_blocks, n_freq_blocks=n_freq_blocks) for _ in range(n_post_layers)])
+        self.pre_blocks = nn.ModuleList([BSRoformerBlock(dim_sp, dim_sp // dim_head, axis='tf', use_time_mix=True, kernel_size=kernel_size, n_time_blocks=1, n_freq_blocks=1) for _ in range(n_pre_layers)])
+        self.post_blocks = nn.ModuleList([BSRoformerBlock(dim_sp, dim_sp // dim_head, axis='tf', use_time_mix=True, kernel_size=kernel_size, n_time_blocks=1, n_freq_blocks=1) for _ in range(n_post_layers)])
         self.blocks = nn.ModuleList([BSRoformerBlock(dim, dim // dim_head, axis='tf', use_time_mix=True, kernel_size=kernel_size, n_time_blocks=n_time_blocks, n_freq_blocks=n_freq_blocks) for _ in range(n_layers)])
 
     def forward(self, audio: Tensor) -> Tensor:
@@ -253,6 +253,7 @@ class BSRoformer(Fourier):
         mean = x.mean(dim=(1, 2, 3), keepdim=True)
         std = x.std(dim=(1, 2, 3), keepdim=True)
         x = (x - mean) / (1e-5 + std)
+        norm_complex_sp = x
 
         # Pad STFT
         x = self.pad_tensor(x)
@@ -285,13 +286,10 @@ class BSRoformer(Fourier):
 
         # Unpad
         x = x[:, :, 0:T0, :, :]
+        x = x * norm_complex_sp
         x = x * std + mean
 
-        # Get complex mask
-        mask = torch.view_as_complex(x)
-
-        # Calculate STFT of separated audio
-        sep_stft = mask * complex_sp
+        sep_stft = torch.view_as_complex(x)
 
         # ISTFT
         output = self.istft(sep_stft)
