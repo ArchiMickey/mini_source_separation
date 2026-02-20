@@ -130,17 +130,19 @@ class TimeMixBlock(nn.Module):
 class BSRoformerBlock(nn.Module):
     """Band-Split RoFormer block with time and/or frequency attention."""
 
-    def __init__(self, dim, n_heads, axis='tf', use_time_mix=False, kernel_size=7):
+    def __init__(self, dim, n_heads, axis='tf', use_time_mix=False, kernel_size=7, n_time_blocks=1, n_freq_blocks=1):
         super().__init__()
         assert axis in ['t', 'f', 'tf', 'ft'], "Axis must be one of 't', 'f', 'tf', or 'ft'."
         self.axis = axis
         self.use_time_mix = use_time_mix
         if 't' in axis:
             if use_time_mix:
-                self.time_block = TimeMixBlock(dim, kernel_size=kernel_size)
+                self.time_blocks = nn.ModuleList([TimeMixBlock(dim, kernel_size=kernel_size) for _ in range(n_time_blocks)])
             else:
-                self.time_block = Block(dim, n_heads)
-        self.freq_block = Block(dim, n_heads) if 'f' in axis else None
+                self.time_blocks = nn.ModuleList([Block(dim, n_heads) for _ in range(n_time_blocks)])
+        else:
+            self.time_blocks = None
+        self.freq_blocks = nn.ModuleList([Block(dim, n_heads) for _ in range(n_freq_blocks)]) if 'f' in axis else None
 
     def forward(self, x: Tensor, rope: RoPE) -> Tensor:
         """
@@ -155,20 +157,22 @@ class BSRoformerBlock(nn.Module):
         """
         B = x.shape[0]
 
-        if self.time_block is not None:
+        if self.time_blocks is not None:
             # Time attention
-            x = rearrange(x, 'b d t f -> (b f) t d')
-            if self.use_time_mix:
-                x = self.time_block(x)
-            else:
-                x = self.time_block(x, rope=rope, pos=None)
-            x = rearrange(x, '(b f) t d -> b d t f', b=B)
+            for time_block in self.time_blocks:
+                x = rearrange(x, 'b d t f -> (b f) t d')
+                if self.use_time_mix:
+                    x = time_block(x)
+                else:
+                    x = time_block(x, rope=rope, pos=None)
+                x = rearrange(x, '(b f) t d -> b d t f', b=B)
 
-        if self.freq_block is not None:
+        if self.freq_blocks is not None:
             # Frequency attention
-            x = rearrange(x, 'b d t f -> (b t) f d')
-            x = self.freq_block(x, rope=rope, pos=None)
-            x = rearrange(x, '(b t) f d -> b d t f', b=B)
+            for freq_block in self.freq_blocks:
+                x = rearrange(x, 'b d t f -> (b t) f d')
+                x = freq_block(x, rope=rope, pos=None)
+                x = rearrange(x, '(b t) f d -> b d t f', b=B)
 
         return x
 
@@ -193,6 +197,8 @@ class BSRoformer(Fourier):
         n_post_layers=1,
         kernel_size=7,
         rope_len=8192,
+        n_time_blocks=1,
+        n_freq_blocks=1,
         **kwargs
     ) -> None:
         super().__init__(
@@ -224,9 +230,9 @@ class BSRoformer(Fourier):
         self.up = nn.ConvTranspose2d(dim, dim_sp, kernel_size=patch_size, stride=patch_size)
         self.fusion = GEGLUFusion(dim_sp)
 
-        self.pre_blocks = nn.ModuleList([BSRoformerBlock(dim_sp, dim_sp // dim_head, axis='tf', use_time_mix=True, kernel_size=kernel_size) for _ in range(n_pre_layers)])
-        self.post_blocks = nn.ModuleList([BSRoformerBlock(dim_sp, dim_sp // dim_head, axis='tf', use_time_mix=True, kernel_size=kernel_size) for _ in range(n_post_layers)])
-        self.blocks = nn.ModuleList([BSRoformerBlock(dim, dim // dim_head, axis='tf', use_time_mix=True, kernel_size=kernel_size) for _ in range(n_layers)])
+        self.pre_blocks = nn.ModuleList([BSRoformerBlock(dim_sp, dim_sp // dim_head, axis='tf', use_time_mix=True, kernel_size=kernel_size, n_time_blocks=n_time_blocks, n_freq_blocks=n_freq_blocks) for _ in range(n_pre_layers)])
+        self.post_blocks = nn.ModuleList([BSRoformerBlock(dim_sp, dim_sp // dim_head, axis='tf', use_time_mix=True, kernel_size=kernel_size, n_time_blocks=n_time_blocks, n_freq_blocks=n_freq_blocks) for _ in range(n_post_layers)])
+        self.blocks = nn.ModuleList([BSRoformerBlock(dim, dim // dim_head, axis='tf', use_time_mix=True, kernel_size=kernel_size, n_time_blocks=n_time_blocks, n_freq_blocks=n_freq_blocks) for _ in range(n_layers)])
 
     def forward(self, audio: Tensor) -> Tensor:
         """
