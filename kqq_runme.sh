@@ -143,7 +143,7 @@ CUDA_VISIBLE_DEVICES=0 python evaluate.py \
 # 64a.yaml      UTransformerCat, others same as 42a
 # 65a.yaml      abs pos, slightly worse
 # 65b.yaml      abs pos, all layers
-# 65c.yaml      layer scale. Better than 42a
+# + 65c.yaml      layer scale. Better than 42a
 # 65d.yaml      layer scale, all freq
 # 66a.yaml      stft 128, 512, 2048 cat
 # 66a2.yaml      stft 128, 512, 2048 cat, weight, worse than 66a
@@ -191,7 +191,7 @@ CUDA_VISIBLE_DEVICES=0 python evaluate.py \
 # 95b.yaml      erb subband=64, n_fft=16, hop=4, patch=(1, 1), others same as 87a
 # 96a.yaml      subband=128, n_fft=16, hop=4, patch=(1, 1), others same as 87a
 # 97a.yaml      conv1d, kernel=32, others as 87a
-# 98a.yaml      overlap subband, others similar to 89c2, but not the same
+# + 98a.yaml      overlap subband, others similar to 89c2, but not the same
 
 # 99a.yaml      sp loss, others same as 87a
 # 99a2.yaml     sp loss scale, others same as 87a, good.
@@ -207,6 +207,44 @@ CUDA_VISIBLE_DEVICES=0 python evaluate.py \
 # 99i.yaml      subband stft loss, others same as 87a 
 
 # 100a.yaml     mel bandsplit, others same as 89c2
+# + 101a.yaml     swiGLU, others same as 89c2
+# - 102a.yaml     only remain 1/6 att, others same as 89c2
+# 102b.yaml     only remain 1/2 att, others same as 89c2
+# - 103a.yaml     scale, others same as 89c2
+# 103b.yaml     scale, constant, others same as 89c2
+# 103c.yaml     scale, 2d, others same as 89c2
+# 103d.yaml     scale, 2d, decompose, others same as 89c2
+# - 104a.yaml     pool attention, others same as 89c2
+# 105a.yaml     24 layers, others same as 89c2
+# 106a.yaml     cross shape att, others same as 89c2 (bs 26s, noatt 13s->20s, fullatt 120s, cross 34s)
+# 107a.yaml     unet-transformer
+# + 107a2.yaml    unet-transformer， fix
+# 107b.yaml     unet-transformer, pixel
+# - 107c.yaml     unet-transformer, pixel_rnn
+# 108a.yaml     subbandloss, others same as 89c2
+# + 108b.yaml     subband_stft_loss, others same as 89c2
+# + 108c.yaml     subband_stft_loss, 1,4,16,64, others same as 89c2
+# 109a.yaml     wav conv1d (jimmy), others same as 89c2
+# jimmy56b.yaml 
+# 110a.yaml     erb band, others same as jimmy56b.yaml
+# ++ 111a.yaml     trianle band, others same as 89c2
+# (no) 111b.yaml     overlap band, others same as 89c2
+# 112a.yaml     lowband fractional stft, others same as 89c2
+# 113a.yaml     mel bandsplit unet, others same as 107a2
+# 114a.yaml     patch=(2, 1), others same as 89c2
+# 114b.yaml     patch=(1, 1), others same as 89c2
+# 115a.yaml     exp band, others same as 111a
+# 115b.yaml     exp_linear2 band, others same as 111a
+# 115c.yaml     erb, b=0.02, others same as 111a
+# + 115d.yaml     mel, others same as 111a
+# 115e.yaml     erb, b=0.001, others same as 111a
+# 115f.yaml     erb, b=0.0005, others same as 111a
+# 115g.yaml     erb, b=0.0001, others same as 111a
+# 115h.yaml     linear band, others same as 111a
+# 115i.yaml     mel + erb + linear bands, others same as 111a
+# - 116a.yaml     band wise matrix, others same as 89c2
+# 117a.yaml     glu, others same as 115d
+# 118a.yaml     glu, unet, others same as 117a
 
 
 # dsp/dsp3 filter compare
