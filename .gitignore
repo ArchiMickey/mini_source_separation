@@ -1,3 +1,10 @@
 **/__pycache__/**
 wandb
 checkpoints
+outputs
+reports
+scripts
+tests
+docs
+logs
+**/*.egg-info

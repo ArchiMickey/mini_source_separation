@@ -1,0 +1,58 @@
+---
+audio_channels: &audio_channels 2
+sample_rate: &sample_rate 48000
+load_duration: 3.
+segment_duration: 2.
+target_stem: "vocals"
+
+train_datasets:
+    MUSDB18HQ:
+        root: "/datasets/musdb18hq"
+        split: "train"
+        time_align: "strict"  # "strict" | "group"
+
+test_datasets:
+    MUSDB18HQ:
+        root: "/datasets/musdb18hq"
+        split: "test"
+        
+sampler: RandomSongSampler
+
+model:
+    name: BSRoformer70
+    audio_channels: *audio_channels
+    sample_rate: *sample_rate
+    n_bands: 64
+    dim: 384
+    dim_sp: 96
+    dim_head: 32
+    patch_size: [4, 1]
+    n_layers: 6
+    n_pre_layers: 1
+    n_post_layers: 1
+    pre_time_block: True
+    post_time_block: True
+    use_checkpoint: True
+    delta_attn_ratio: 2
+    conv_kernel_size: 7
+    frame_rate: 100
+
+train:
+    device: cuda
+    num_workers: 8
+    # num_workers: 0
+    precision: "bf16"  # "no" (fp32) | bf16"
+    loss: l1_wav_l1_multistft
+    optimizer: AdamW
+    lr: 3e-4
+    max_grad_norm: 1.0 # Leave blank if no gradient clipping is used
+    warm_up_steps: 1000  # Leave blank if no warm up is used
+    batch_size_per_device: 4
+    gradient_accumulation_steps: 1
+    test_every_n_steps: 20000
+    save_every_n_steps: 50000
+    training_steps: 1000000
+    resume_ckpt_path:  # Leave blank if train from scratch
+
+validate:
+    audios_num: 5
