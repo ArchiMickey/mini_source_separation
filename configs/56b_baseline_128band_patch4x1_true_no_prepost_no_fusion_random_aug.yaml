@@ -45,17 +45,21 @@ test_datasets:
 sampler: RandomSongSamplerMix
 
 model:
-    name: BSRoformer89c4
+    name: BSRoformer56b
     audio_channels: *audio_channels
     sample_rate: *sample_rate
-    subband_n_bands: 128
+    n_fft: 2048
+    hop_length: 480
+    n_bands: 128
+    band_dim: 64
     dim: 384
     dim_sp: 96
     dim_head: 32
     patch_size: [4, 1]
     n_layers: 6
-    n_pre_layers: 1
-    n_post_layers: 1    
+    n_pre_layers: 0
+    n_post_layers: 0
+    use_fusion: false
 
 train:
     device: cuda

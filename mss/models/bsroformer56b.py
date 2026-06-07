@@ -189,6 +189,7 @@ class BSRoformer(Fourier):
         n_layers=12,
         n_pre_layers=1,
         n_post_layers=1,
+        use_fusion=True,
         rope_len=8192,
         **kwargs
     ) -> None:
@@ -201,6 +202,7 @@ class BSRoformer(Fourier):
 
         self.ac = audio_channels
         self.patch_size = patch_size
+        self.use_fusion = bool(use_fusion)
 
         # Band split
         self.bandsplit = BandSplit(
@@ -219,7 +221,7 @@ class BSRoformer(Fourier):
         self.unpatch = nn.Conv2d(dim_sp, band_dim * audio_channels, kernel_size=1)
         self.down = nn.Conv2d(dim_sp, dim, kernel_size=patch_size, stride=patch_size)
         self.up = nn.ConvTranspose2d(dim, dim_sp, kernel_size=patch_size, stride=patch_size)
-        self.fusion = GEGLUFusion(dim_sp)
+        self.fusion = GEGLUFusion(dim_sp) if self.use_fusion else None
 
         self.pre_blocks = nn.ModuleList([BSRoformerBlock(dim_sp, dim_sp // dim_head, axis='tf', use_time_mix=True) for _ in range(n_pre_layers)])
         self.post_blocks = nn.ModuleList([BSRoformerBlock(dim_sp, dim_sp // dim_head, axis='tf', use_time_mix=True) for _ in range(n_post_layers)])
@@ -259,7 +261,8 @@ class BSRoformer(Fourier):
             x = block(x, rope=self.rope) 
 
         x = self.up(x)
-        x = self.fusion(x, h)
+        if self.fusion is not None:
+            x = self.fusion(x, h)
         for block in self.post_blocks:
             x = block(x, rope=self.rope)
 

@@ -10,6 +10,7 @@ from mss.models.bsroformer56b import BSRoformerBlock, GEGLUFusion
 from mss.models.rope import RoPE
 from mss.models2.dsp3.banks import mel_linear_banks_triangle
 from mss.models2.dsp3.subband_fast_triangle import SubbandFilter
+from mss.models2.torchdsp.transforms.stft import STFTLearnable
 
 
 class BSRoformer89c4(nn.Module):
@@ -31,9 +32,16 @@ class BSRoformer89c4(nn.Module):
         rope_len: int = 8192,
         hop_length: int = 4,
         analysis_type: str = "cnn",
-        cnn_mask_mode: str = "feature",
+        mask_mode: str | None = None,
+        cnn_mask_mode: str | None = None,
+        stft_mask_mode: str | None = None,
         n_fft: int = 32,
         stft_hop_length: int = 8,
+        stft_backend: str | None = None,
+        learnable_stft: bool | None = None,
+        stft_n_fractions: int = 1,
+        stft_dft_init: bool = True,
+        stft_learnable: bool = True,
         bank_type: str = "mel_linear_triangle",
         subband_factor: int | None = None,
         max_bandwidth: int = 390,
@@ -56,9 +64,16 @@ class BSRoformer89c4(nn.Module):
         self.subband_n_bands = int(subband_n_bands or n_bands or 118)
         self.hop_length = int(hop_length)
         self.analysis_type = self._normalize_analysis_type(analysis_type)
-        self.cnn_mask_mode = self._normalize_cnn_mask_mode(cnn_mask_mode)
+        self.mask_mode = self._resolve_mask_mode(mask_mode, cnn_mask_mode, stft_mask_mode)
+        self.cnn_mask_mode = self.mask_mode
+        self.stft_mask_mode = self.mask_mode
         self.n_fft = int(n_fft)
         self.stft_hop_length = int(stft_hop_length)
+        self.stft_backend = self._resolve_stft_backend(stft_backend, learnable_stft)
+        self.stft_n_fractions = int(stft_n_fractions)
+        if self.stft_n_fractions < 1:
+            raise ValueError(f"stft_n_fractions must be >= 1, got {self.stft_n_fractions}")
+        self.stft_bins = self.n_fft * self.stft_n_fractions if self.stft_backend == "learnable" else self.n_fft
         self.bank_type = bank_type
         self.sb_factor = int(subband_factor or max(sample_rate // 800, 1))
         self._last_cnn_input_length: int | None = None
@@ -81,9 +96,20 @@ class BSRoformer89c4(nn.Module):
         )
 
         self.rope = RoPE(head_dim=dim_head, max_len=rope_len)
-        self.feature_dim = dim_sp if self.analysis_type == "cnn" else audio_channels * self.n_fft * 2
+        self.feature_dim = dim_sp if self.analysis_type == "cnn" else audio_channels * self.stft_bins * 2
         if self.feature_dim % dim_head != 0:
             raise ValueError(f"feature_dim={self.feature_dim} must be divisible by dim_head={dim_head}")
+
+        if self.analysis_type == "stft" and self.stft_backend == "learnable":
+            self.stft_transform = STFTLearnable(
+                n_fft=self.n_fft,
+                hop_length=self.stft_hop_length,
+                n_fractions=self.stft_n_fractions,
+                dft_init=stft_dft_init,
+                learnable=stft_learnable,
+            )
+        else:
+            self.stft_transform = None
 
         if self.analysis_type == "cnn":
             self.cnn_encoder = nn.Conv2d(
@@ -143,21 +169,75 @@ class BSRoformer89c4(nn.Module):
             raise ValueError(f"Unsupported analysis_type: {analysis_type}")
         return analysis_type
 
-    def _normalize_cnn_mask_mode(self, cnn_mask_mode: str) -> str:
+    def _resolve_stft_backend(self, stft_backend: str | None, learnable_stft: bool | None) -> str:
+        if stft_backend is None:
+            return "learnable" if learnable_stft else "torch"
+
+        backend = stft_backend.lower()
         aliases = {
-            "feature": "feature",
-            "features": "feature",
-            "cnn": "feature",
-            "cnn_feature": "feature",
-            "cnn_features": "feature",
+            "torch": "torch",
+            "pytorch": "torch",
+            "fixed": "torch",
+            "learnable": "learnable",
+            "learned": "learnable",
+            "stft_learnable": "learnable",
+        }
+        try:
+            backend = aliases[backend]
+        except KeyError as exc:
+            raise ValueError(f"Unsupported stft_backend: {stft_backend}") from exc
+
+        if learnable_stft is not None:
+            requested = "learnable" if learnable_stft else "torch"
+            if backend != requested:
+                raise ValueError(
+                    f"stft_backend={backend!r} conflicts with learnable_stft={learnable_stft!r}"
+                )
+        return backend
+
+    def _resolve_mask_mode(
+        self,
+        mask_mode: str | None,
+        cnn_mask_mode: str | None,
+        stft_mask_mode: str | None,
+    ) -> str:
+        legacy_mask_mode = cnn_mask_mode if self.analysis_type == "cnn" else stft_mask_mode
+        if mask_mode is not None and legacy_mask_mode is not None:
+            mask_mode = self._normalize_mask_mode(mask_mode)
+            legacy_mask_mode = self._normalize_mask_mode(legacy_mask_mode)
+            if mask_mode != legacy_mask_mode:
+                raise ValueError(
+                    f"mask_mode={mask_mode!r} conflicts with legacy "
+                    f"{self.analysis_type}_mask_mode={legacy_mask_mode!r}"
+                )
+            return mask_mode
+        if mask_mode is not None:
+            return self._normalize_mask_mode(mask_mode)
+        if legacy_mask_mode is not None:
+            return self._normalize_mask_mode(legacy_mask_mode)
+        return "features"
+
+    def _normalize_mask_mode(self, mask_mode: str) -> str:
+        aliases = {
+            "feature": "features",
+            "features": "features",
+            "transform": "features",
+            "transform_feature": "features",
+            "transform_features": "features",
+            "cnn": "features",
+            "cnn_feature": "features",
+            "cnn_features": "features",
+            "stft": "features",
+            "stft_feature": "features",
+            "stft_features": "features",
             "subband": "subband",
             "subbands": "subband",
             "subband_analysis": "subband",
         }
         try:
-            return aliases[cnn_mask_mode.lower()]
+            return aliases[mask_mode.lower()]
         except KeyError as exc:
-            raise ValueError(f"Unsupported cnn_mask_mode: {cnn_mask_mode}") from exc
+            raise ValueError(f"Unsupported mask_mode: {mask_mode}") from exc
 
     def _build_banks(
         self,
@@ -215,16 +295,20 @@ class BSRoformer89c4(nn.Module):
         raise RuntimeError(f"Unhandled analysis_type: {self.analysis_type}")
 
     def apply_mask_and_synthesize(self, subbands: Tensor, features: Tensor, mask: Tensor) -> Tensor:
-        if self.analysis_type == "stft":
-            complex_sp = self.stft_channels_to_complex(features)
-            complex_mask = self.stft_channels_to_complex(mask)
-            return self.istft(complex_sp * complex_mask)
-
-        if self.cnn_mask_mode == "feature":
+        if self.mask_mode == "features":
+            if self.analysis_type == "stft":
+                complex_sp = self.stft_channels_to_complex(features)
+                complex_mask = self.stft_channels_to_complex(mask)
+                return self.istft(complex_sp * complex_mask)
             return self.cnn_synthesis(features * mask)
-        if self.cnn_mask_mode == "subband":
+
+        if self.mask_mode == "subband":
+            if self.analysis_type == "stft":
+                complex_mask = self.stft_channels_to_complex(mask)
+                return subbands * self.istft(complex_mask)
             return subbands * self.cnn_synthesis(mask)
-        raise RuntimeError(f"Unhandled cnn_mask_mode: {self.cnn_mask_mode}")
+
+        raise RuntimeError(f"Unhandled mask_mode: {self.mask_mode}")
 
     def stft_analysis(self, x: Tensor) -> Tensor:
         self._last_stft_input_length = x.shape[-1]
@@ -239,7 +323,7 @@ class BSRoformer89c4(nn.Module):
             x,
             "b (c f ri) t k -> b c k t f ri",
             c=self.audio_channels,
-            f=self.n_fft,
+            f=self.stft_bins,
             ri=2,
         )
         return torch.view_as_complex(x.contiguous().float())
@@ -247,6 +331,12 @@ class BSRoformer89c4(nn.Module):
     def stft(self, x: Tensor) -> Tensor:
         B, C = x.shape[0:2]
         x = rearrange(x, "b c k l -> (b c k) l")
+        if self.stft_backend == "learnable":
+            if self.stft_transform is None:
+                raise RuntimeError("Learnable STFT backend was requested but stft_transform is not initialized")
+            x = self.stft_transform.analysis(x)
+            return rearrange(x, "(b c k) t f -> b c k t f", b=B, c=C)
+
         x = torch.stft(
             input=x,
             n_fft=self.n_fft,
@@ -260,6 +350,13 @@ class BSRoformer89c4(nn.Module):
 
     def istft(self, x: Tensor) -> Tensor:
         B, C = x.shape[0:2]
+        if self.stft_backend == "learnable":
+            if self.stft_transform is None:
+                raise RuntimeError("Learnable STFT backend was requested but stft_transform is not initialized")
+            x = rearrange(x, "b c k t f -> (b c k) t f")
+            x = self.stft_transform.synthesis(x, self._last_stft_input_length)
+            return rearrange(x, "(b c k) l -> b c k l", b=B, c=C)
+
         x = rearrange(x, "b c k t f -> (b c k) f t")
         x = torch.istft(
             input=x,
@@ -342,6 +439,9 @@ class BSRoformer89c4(nn.Module):
         if out.shape[-1] < audio_length:
             out = F.pad(out, pad=(0, audio_length - out.shape[-1]))
         return out
+
+
+BSRoformer89c4a = BSRoformer89c4
 
 
 if __name__ == "__main__":

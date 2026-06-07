@@ -391,6 +391,9 @@ def get_model(
     elif name == "BSRoformer57c":
         from mss.models.bsroformer57c import BSRoformer
         model = BSRoformer(**configs["model"])
+    elif name == "BSRoformer89c4a":
+        from mss.models.bsroformer89c4a import BSRoformer89c4a as BSRoformer
+        model = BSRoformer(**configs["model"])
 
     else:
         raise ValueError(name)    
@@ -414,6 +417,14 @@ def get_loss_fn(configs: dict) -> callable:
     elif loss_type == "l1_wav_l1_multistft":
         from mss.losses.wav_stft import MultiResolutionSTFTLoss
         return MultiResolutionSTFTLoss()
+
+    elif loss_type == "multi_subband_l1":
+        from mss.losses.subband_mrstft import MultiSubbandL1Loss
+        return MultiSubbandL1Loss()
+
+    elif loss_type == "multi_subband_mrstft":
+        from mss.losses.subband_mrstft import MultiSubbandMRSTFTLoss
+        return MultiSubbandMRSTFTLoss()
 
     else:
         raise ValueError(loss_type)
@@ -456,11 +467,17 @@ def _load_audio_torchaudio(audio_path: Path, sr: int) -> np.ndarray:
     Returns:
         audio: (c, L) numpy array
     """
-    waveform, orig_sr = torchaudio.load(audio_path)  # (c, L)
-    if orig_sr != sr:
-        resampler = torchaudio.transforms.Resample(orig_sr, sr)
-        waveform = resampler(waveform)
-    return waveform.numpy()
+    try:
+        waveform, orig_sr = torchaudio.load(audio_path)  # (c, L)
+        if orig_sr != sr:
+            resampler = torchaudio.transforms.Resample(orig_sr, sr)
+            waveform = resampler(waveform)
+        return waveform.numpy()
+    except (ImportError, RuntimeError):
+        audio, _ = librosa.load(audio_path, sr=sr, mono=False)
+        if audio.ndim == 1:
+            audio = audio[None, :]
+        return audio.astype(np.float32, copy=False)
 
 
 def _load_song_data(
